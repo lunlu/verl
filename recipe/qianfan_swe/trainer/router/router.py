@@ -150,7 +150,7 @@ async def poll_completions_openai(address: str, **completions_request) -> Comple
     if "application_id" in completions_request:
         application_id = completions_request.pop("application_id")
 
-    max_retries = 3
+    max_retries = 5
     retry_delay = 1  # Initial delay in seconds
     print(f"API request params is : application_id is {application_id}, base_url={base_url}, headers={headers}")
     
@@ -158,7 +158,7 @@ async def poll_completions_openai(address: str, **completions_request) -> Comple
         try:
             # Create a new session for each request to avoid blocking
             async with aiohttp.ClientSession() as session:
-                async with session.post(base_url, json=completions_request, headers=headers, timeout=aiohttp.ClientTimeout(total=2700)) as response:
+                async with session.post(base_url, json=completions_request, headers=headers, timeout=aiohttp.ClientTimeout(total=5400)) as response:
                     if response.status != 200:
                         error_text = await response.text()
                         print(f"API request params is : base_url={base_url}, headers={headers}")
@@ -172,6 +172,7 @@ async def poll_completions_openai(address: str, **completions_request) -> Comple
             traceback.print_exc()
             # If this is the last retry, raise the exception
             if retry == max_retries - 1:
+                print(f"[RouterLogs] current api request params is : application_id is {application_id}, base_url={base_url}, headers={headers}, completions_request is {completions_request}, error reason is {e}")
                 raise e
             # Exponential backoff
             await asyncio.sleep(retry_delay)
@@ -328,7 +329,26 @@ class Router:
         end_time = time.time()
         print(f"[TrainingLogsRouter] current idx is {idx}, current application id is {application_id}, request address is {address}, model is {self.model_name}, kwargs is {kwargs}, cost time {end_time - start_time}")
 
-        return await self.postprocess_batch(batch, batch_response_ids, kwargs["n"])
+#         return await self.postprocess_batch(batch, batch_response_ids, kwargs["n"])
+        # Extract inference log probs for IcePop
+        batch_inference_logprobs = []
+        for batch_index, completions in enumerate(completions_list):
+            inf_logprobs = []
+            for choice in completions.get("choices", []):
+                logprobs_data = choice.get("logprobs", {})
+                token_logprobs = logprobs_data.get("token_logprobs", [])
+                tokens = logprobs_data.get("tokens", [])
+
+                # vLLM returns prompt+response logprobs, slice to get response only
+                if tokens and token_logprobs:
+                    response_length = len(tokens)
+                    response_logprobs = token_logprobs[-response_length:] if len(token_logprobs) >= response_length else token_logprobs
+                    inf_logprobs.append(response_logprobs)
+                else:
+                    inf_logprobs.append(token_logprobs)
+            batch_inference_logprobs.append(inf_logprobs)
+
+        return await self.postprocess_batch(batch, batch_response_ids, kwargs["n"], batch_inference_logprobs)
 
     async def submit_completions(self, address, model, prompt, **kwargs):
         """
@@ -342,7 +362,7 @@ class Router:
         # Potential blocking: network I/O can block
         return await poll_completions_openai(address=address, model=model, prompt=prompt, **kwargs)
 
-    async def postprocess_batch(self, batch: DataProto, response_ids: list[list[int]], n: int) -> DataProto:
+    async def postprocess_batch(self, batch: DataProto, response_ids: list[list[int]], n: int, inference_logprobs: list[list[list[float]]] = None) -> DataProto:
         """
         Postprocess the batch of responses from the model server.
         
@@ -396,6 +416,23 @@ class Router:
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
         response_attention_mask = get_response_mask(response_id=response_tensor, eos_token=self.eos_token_id, dtype=attention_mask.dtype)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+        
+        # Process inference log probs if provided
+        inf_log_probs_tensor = None
+        if inference_logprobs is not None:
+            # Flatten inference_logprobs similar to response_ids
+            flat_inf_logprobs = []
+            for inf_logprobs_per_prompt in inference_logprobs:
+                if inf_logprobs_per_prompt is not None:
+                    for inf_logprobs in inf_logprobs_per_prompt:
+                        flat_inf_logprobs.append(inf_logprobs)
+
+            # Pad to same length as response_tensor
+            inf_log_probs_tensor = pad_2d_list_to_length(
+                flat_inf_logprobs,
+                0.0,  # Pad with 0.0 for log probs
+                max_length=self.config.actor_rollout_ref.rollout.response_length
+            ).to(idx.device)
 
         output = TensorDict(
             {
@@ -407,4 +444,9 @@ class Router:
             },
             batch_size=batch_size,
         )
+        
+        # Add inference log probs if available
+        if inf_log_probs_tensor is not None:
+            output["inf_log_probs"] = inf_log_probs_tensor
+            
         return DataProto(batch=output, meta_info=batch.meta_info)
