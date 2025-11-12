@@ -122,6 +122,12 @@ class ActorConfig(BaseConfig):
     n: int = 1  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     grad_norm_threshold: float = 1e5
+    enable_moe_logging: bool = False
+    enable_icepop: bool = False
+    icepop_alpha: float = 0.6
+    icepop_beta: float = 1.5
+    enable_tis: bool = False
+    tis_clip_threshold: float = 2
 
     def __post_init__(self):
         """Validate actor configuration parameters."""

@@ -343,6 +343,7 @@ class RLHFDataset(Dataset):
         # add index for each prompt
         if "extra_info" not in row_dict or row_dict["extra_info"] is None:
             row_dict["extra_info"] = dict()
+        extra_info = row_dict["extra_info"]
         if isinstance(row_dict.get("extra_info", {}), str):
             extra_info = json.loads(row_dict.get("extra_info", {}))
         index = extra_info.get("index", 0)
