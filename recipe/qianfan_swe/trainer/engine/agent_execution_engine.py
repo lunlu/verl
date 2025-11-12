@@ -325,9 +325,10 @@ class AgentExecutionEngine:
 
             # Start timing for the entire trajectory
             trajectory_start_time = time.time()
-            
+            inference_log_probs_list = []
+            llm_all_tokens = []
             try:
-                trajectory_result, inference_log_probs_list, llm_all_tokens = await asyncio.wait_for(
+                results = await asyncio.wait_for(
                     agent.run_trajectory(
                         prompt=prompt,
                         llm_generate_func=self._get_verl_async,
@@ -345,6 +346,11 @@ class AgentExecutionEngine:
                     ),
                     timeout=(self.trajectory_timeout*2)
                 )
+                if isinstance(result, tuple):
+                    trajectory_result, inference_log_probs_list, llm_all_tokens = results
+                else:
+                    trajectory_result = results
+                    
                 total_time = time.time() - trajectory_start_time
                 
                 termination_reason = trajectory_result.metadata["stop_reason"]
@@ -415,7 +421,10 @@ class AgentExecutionEngine:
                 if self.chat_parser:
                     if msg["role"] == "assistant":
                         response_token, response_mask = convert_messages_to_tokens_and_masks([msg], tokenizer=self.tokenizer, parser=self.chat_parser, contains_first_msg=False, contains_generation_msg=False)
-                        step_inf_log_probs = inference_log_probs_list[assistant_index]
+                        if inference_log_probs_list:
+                            step_inf_log_probs = inference_log_probs_list[assistant_index]
+                        else:
+                            step_inf_log_probs = None
                         if step_inf_log_probs is not None and len(response_token) != step_inf_log_probs.shape[0]:
                             if step_inf_log_probs.shape[0] > len(response_token):
                                 # Trim logprobs to match re-tokenized length
