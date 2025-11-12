@@ -154,8 +154,7 @@ class PodManager:
             "http_proxy": "http://agent.baidu.com:8891",
             "https_proxy": "http://agent.baidu.com:8891",
             "PIP_INDEX_URL": "http://pip.baidu.com/pypi/simple",
-            "PIP_TRUSTED_HOST": "pip.baidu.com",
-            "PATH": "/usr/local/jupyter:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin:/root/.local/share/mise/installs/python/latest/bin:/root/.local/share/mise/installs/node/latest/bin:/pnpm-store"
+            "PIP_TRUSTED_HOST": "pip.baidu.com"
         }
         
         # Try to start pod up to max_retries
