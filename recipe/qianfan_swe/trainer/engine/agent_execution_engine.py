@@ -345,7 +345,7 @@ class AgentExecutionEngine:
                     ),
                     timeout=(self.trajectory_timeout*2)
                 )
-                if isinstance(result, tuple):
+                if isinstance(results, tuple):
                     trajectory_result, inference_log_probs_list = results
                 else:
                     trajectory_result = results
