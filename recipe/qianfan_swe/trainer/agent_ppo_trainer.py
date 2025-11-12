@@ -602,7 +602,7 @@ class AgentPPOTrainer(RayPPOTrainer):
             all_masks_list.append(traj["response_masks"])
             traj_scores.append(traj["trajectory_reward"])
             # Get inference log probs if available
-            traj_inf_log_probs = traj.get("inf_log_probs", None) if traj.get("inf_log_probs", None) else ""
+            traj_inf_log_probs = traj.get("inf_log_probs", None)
             all_inf_log_probs_list.append(traj_inf_log_probs)
             
             chat_completions.append(traj["chat_completions"])
@@ -614,7 +614,7 @@ class AgentPPOTrainer(RayPPOTrainer):
                     "prompt_tokens": str(prompt_tokens.tolist()),
                     "response_tokens": str(response_tokens.tolist()),
                     "response_masks": str(traj["response_masks"].tolist()),
-                    "traj_inf_log_probs": str(traj_inf_log_probs),
+                    "traj_inf_log_probs": str(traj_inf_log_probs.tolist()) if traj_inf_log_probs else "",
                     "chat_completions": traj["chat_completions"],
                     "trajectory_reward": str(traj["trajectory_reward"]),
                     "metrics": str(traj["metrics"]),
