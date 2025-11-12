@@ -326,7 +326,6 @@ class AgentExecutionEngine:
             # Start timing for the entire trajectory
             trajectory_start_time = time.time()
             inference_log_probs_list = []
-            llm_all_tokens = []
             try:
                 results = await asyncio.wait_for(
                     agent.run_trajectory(
@@ -347,7 +346,7 @@ class AgentExecutionEngine:
                     timeout=(self.trajectory_timeout*2)
                 )
                 if isinstance(result, tuple):
-                    trajectory_result, inference_log_probs_list, llm_all_tokens = results
+                    trajectory_result, inference_log_probs_list = results
                 else:
                     trajectory_result = results
                     
@@ -366,7 +365,6 @@ class AgentExecutionEngine:
                 termination_reason = "TIMEOUT"
                 reward = 0.0
             
-            llm_all_tokens = [x.tolist() for x in llm_all_tokens]
             # Check if agent reached max rounds without calling termination tool
             reached_max_rounds = len(trajectory_result.steps) >= self.max_steps * 2  # Rough estimate: 50 rounds * 2 steps per round
             called_submit = any(
