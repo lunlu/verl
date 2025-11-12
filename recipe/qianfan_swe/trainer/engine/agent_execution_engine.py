@@ -521,39 +521,6 @@ class AgentExecutionEngine:
                     "reward_info": reward_info
                 },
             }
-            
-            job_name = os.environ.get("FULL_JOB_NAME", "default_job")
-            # 构建输出目录
-            base_dir = "/mnt/cfs_bj_mt/workspace/tianlun-2/grpo_train/tmp/tmp_completions"
-            output_dir = os.path.join(base_dir, job_name)
-            os.makedirs(output_dir, exist_ok=True)
-            with open(f"{output_dir}/{idx}.jsonl", "w") as f:
-                token_result1 = {
-                    "trajectory_reward": reward,
-                    "docker": self.images[idx],
-                    "idx": idx,
-                    "llm_all_tokens": llm_all_tokens,
-                    "prompt_tokens": prompt_tokens,
-                    "response_tokens": response_tokens,
-                    "response_masks": response_masks,
-                    "inf_log_probs": traj_inf_log_probs.tolist(),
-                    "chat_completions": result_messages,
-                    "termination_reason": termination_reason,
-                    "masked_out": float(masked_out),
-                    "metrics": {
-                        # Total number of steps taken in the trajectory
-                        "steps": len(trajectory_result.steps)//2 if hasattr(trajectory_result, 'steps') else 0,
-                        # Total time spent in the trajectory
-                        "total_time": total_time,
-                        # Token length information
-                        "prompt_token_len": prompt_token_len,
-                        "response_token_len": response_token_len,
-                        "reward_info": reward_info
-                    },
-                }
-
-                f.write(json.dumps(token_result1, ensure_ascii=False))
-                f.write("\n")
             return token_result
 
         except Exception as e:
