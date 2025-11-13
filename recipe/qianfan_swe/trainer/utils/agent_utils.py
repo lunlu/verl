@@ -181,9 +181,8 @@ def _create_agent(i, env_args, config):
         print("[TrainingLogs] Using system prompt from system_yaml!")
 
         # Create agent using the configured agent class
-        agent = AgentFactory(
             max_rounds=config.agent.max_steps,
-            debug=config.agent.debug,
+            debug=config.agent.get("debug", False),
             termination_tool_names=config.agent.termination_tool_names,
             action_parser=parse_xml_action_custom,
             profiler=None,
