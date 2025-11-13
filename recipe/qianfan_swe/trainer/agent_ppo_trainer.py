@@ -614,7 +614,7 @@ class AgentPPOTrainer(RayPPOTrainer):
                     "prompt_tokens": str(prompt_tokens.tolist()),
                     "response_tokens": str(response_tokens.tolist()),
                     "response_masks": str(traj["response_masks"].tolist()),
-                    "traj_inf_log_probs": str(traj_inf_log_probs.tolist()) if traj_inf_log_probs else "",
+                    "traj_inf_log_probs": str(traj_inf_log_probs.tolist()) if traj_inf_log_probs is not None else "",
                     "chat_completions": traj["chat_completions"],
                     "trajectory_reward": str(traj["trajectory_reward"]),
                     "metrics": str(traj["metrics"]),
