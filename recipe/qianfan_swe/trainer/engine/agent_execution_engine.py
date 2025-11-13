@@ -285,9 +285,7 @@ class AgentExecutionEngine:
         pad_token = self.tokenizer.pad_token
         eos_token = self.tokenizer.eos_token
         response = response.replace(pad_token, "").replace(eos_token, "")
-        
-#         return response
-        # Return response, inference log probs, and trimmed tokens
+
         return response, trimmed_log_probs, trimmed
 
     async def run_agent_trajectory_async(self, idx, application_id, seed=0, mode="Text", **kwargs):
@@ -573,7 +571,7 @@ class AgentExecutionEngine:
         """
         for ind in range(self.retry_limit):
             try:
-                return await asyncio.wait_for(self.run_agent_trajectory_async(idx, application_id=application_id, seed=seed, mode=mode, **kwargs), timeout=18000)
+                return await asyncio.wait_for(self.run_agent_trajectory_async(idx, application_id=application_id, seed=seed, mode=mode, **kwargs), timeout=5400)
             except Exception as e:
                 stack_trace = traceback.format_exc()
                 print(f"[TrainingLogs] func run_agent_trajectory_with_retry, generate trajectory error, error msg is {e}, response params is idx: {idx}, application_id: {application_id}, mode: {mode}, kwargs: {kwargs}, corresponding traceback code is : {stack_trace}, retry is {ind}/{self.retry_limit}")
@@ -790,18 +788,30 @@ class AgentExecutionEngine:
             # Determine environment type based on env attributes
             if not ds:
                 raise ValueError("Cannot find dataset (ds) in environment")
-                
+            
+            sample_type = ds.get("sample_type", "r2e")
             # Check if it's swebench verified
-            docker_image = ds["docker_image"] if "docker_image" in ds else ""
-            swebench_verified = "sweb" in docker_image
-            miaoda_task = "miaoda" in docker_image
+            if "docker_image" in ds:
+                docker_image = ds.get("docker_image", "")
+            elif "docker" in ds:
+                docker_image = ds.get("docker", "")
+            else:
+                raise Exception("[TrainingLogs] please provide docker or docker_image in sample!")
+                
+            print(f"[TrainingLogs] current sample type is {sample_type}, docker_image is {docker_image}")
+            
+            swebench_verified = sample_type.lower() == "swebench"
+            miaoda_task = sample_type.lower() == "md"
+            r2e_task = sample_type.lower() == "r2e"
             
             if swebench_verified:
                 return self._calculate_reward_swebench_pod_manager(pod_manager, pod_name, ds, "/", timeout=300)
             elif miaoda_task:
                 return self._calculate_reward_miaoda_pod_manager(pod_manager, pod_name, ds, "/workspace", timeout=300)
-            else:
+            elif r2e_task:
                 return self._calculate_reward_r2e_pod_manager(pod_manager, pod_name, ds, "/root", timeout=300)
+            else:
+                print(f"[TrainingLogs] sample type only support `r2e/swebench/md`, but get {sample_type}, docker_image is {docker_image}")
                 
         except Exception as e:
             print(f"[RewardLogs] Error calculating reward: {e}")

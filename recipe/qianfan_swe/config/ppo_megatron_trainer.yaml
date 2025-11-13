@@ -210,5 +210,5 @@ agent:
   agent_args: {}
   engine_args: {}
   working_dir: ""
-  namespace: "qianfan-train-cpu-ns"
-  kubeconfig_path: "/mnt/cfs_bj_mt/workspace/tianlun-2/tools/config_cpu_train"
+  namespace: "xxx"
+  kubeconfig_path: "xxx"
