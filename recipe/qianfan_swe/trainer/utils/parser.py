@@ -125,13 +125,8 @@ class ChatTemplateParser:
             tokenizer_cls = tokenizer.__class__.__name__.lower()
             print(f"model_name: {model_name}, tokenizer_cls: {tokenizer_cls}")
             if any(x in model_name for x in ("deepseek", "deepscaler", "deepcoder")) and "llama" in tokenizer_cls:
-                # Check if it's DeepSeek V3.1 model
-                if "v3.1" in model_name or "v3-1" in model_name:
-                    print(f"Using DeepseekV31TerminusSWEChatTemplateParser for {tokenizer.name_or_path}")
-                    return DeepseekV31TerminusSWEChatTemplateParser(tokenizer, disable_thinking=disable_thinking)
-                else:
-                    print(f"Using DeepseekQwenChatTemplateParser for {tokenizer.name_or_path}")
-                    return DeepseekQwenChatTemplateParser(tokenizer, disable_thinking=disable_thinking, model_name=model_name)
+                print(f"Using DeepseekQwenChatTemplateParser for {tokenizer.name_or_path}")
+                return DeepseekQwenChatTemplateParser(tokenizer, disable_thinking=disable_thinking, model_name=model_name)
             elif "qwen" in model_name or "r2e" in model_name or "deepswe" in model_name or "qwen" in tokenizer_cls:
                 print(f"Using QwenChatTemplateParser for {tokenizer.name_or_path}")
                 return QwenChatTemplateParser(tokenizer, disable_thinking=disable_thinking)

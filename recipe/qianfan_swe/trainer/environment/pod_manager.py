@@ -154,7 +154,8 @@ class PodManager:
             "http_proxy": "http://agent.baidu.com:8891",
             "https_proxy": "http://agent.baidu.com:8891",
             "PIP_INDEX_URL": "http://pip.baidu.com/pypi/simple",
-            "PIP_TRUSTED_HOST": "pip.baidu.com"
+            "PIP_TRUSTED_HOST": "pip.baidu.com",
+            "PATH": "/usr/local/jupyter:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin:/root/.local/share/mise/installs/python/latest/bin:/root/.local/share/mise/installs/node/latest/bin:/pnpm-store"
         }
         
         # Try to start pod up to max_retries
@@ -332,10 +333,36 @@ class PodManager:
         print(f"[PodManager] Cleanup completed: {killed_count}/{len(pod_names)} pods killed")
         return killed_count
     
-    def initialize_r2e_pod(self, pod_name: str):
+    def initialize_pod(self, pod_name: str, sample_type: str = 'r2e', **kwargs):
+        """
+        Universal initialization method that routes to specific initialization based on scene.
+
+        Args:
+            pod_name: Name of the pod to initialize
+            scene: Scene type to route initialization ('r2e', 'swebench', or 'md'). Defaults to 'r2e'.
+            **kwargs: Additional keyword arguments to pass to the specific initialization method
+
+        Raises:
+            ValueError: If scene is not recognized
+        """
+        sample_type_lower = sample_type.lower()
+
+        if sample_type_lower == 'r2e':
+            print(f"[PodManager] Routing to R2E initialization for pod {pod_name}")
+            self.initialize_r2e_pod(pod_name, **kwargs)
+        elif sample_type_lower == 'swebench':
+            print(f"[PodManager] Routing to SWE-bench initialization for pod {pod_name}")
+            self.initialize_swebench_pod(pod_name, **kwargs)
+        elif sample_type_lower == 'md':
+            print(f"[PodManager] Routing to MD initialization for pod {pod_name}")
+            self.initialize_md_pod(pod_name, **kwargs)
+        else:
+            raise ValueError(f"Unknown scene type: {scene}. Must be one of: 'r2e', 'swebench', 'md'")
+
+    def initialize_r2e_pod(self, pod_name: str, **kwargs):
         """
         Initialize R2E pod environment with required setup commands.
-        
+
         Args:
             pod_name: Name of the pod to initialize
         """
@@ -384,7 +411,7 @@ class PodManager:
             print(f"[PodManager] Error initializing R2E pod {pod_name}: {e}")
             # Don't raise the exception as initialization failure shouldn't stop trajectory execution
     
-    def initialize_swebench_pod(self, pod_name: str):
+    def initialize_swebench_pod(self, pod_name: str, **kwargs):
         """
         Initialize SWE-bench pod environment with required setup commands.
         
@@ -399,11 +426,12 @@ class PodManager:
             self.execute_command(pod_name, "ln -s /opt/miniconda3/envs/testbed /root/.venv")
             
             #正常使用self.config.agent.chardet_path
-            chardet_path = "/mnt/cfs_bj_mt/workspace/tianlun-2/grpo_train/packages/chardet-3.0.0-py2.py3-none-any.whl"
+            chardet_path = os.os.getenv("CHARTDET_PATH", "")
             #正常使用self.config.agent.dest_path
-            dest_path= "/usr/local/bin/chardet-3.0.0-py2.py3-none-any.whl"
-            self.kodo_runner.copy_to_container(pod_name, chardet_path, dest_path)
-            self.execute_command(pod_name, f"python -m pip install {dest_path}")
+            if chardet_path:
+                dest_path= "/usr/local/bin/chardet-3.0.0-py2.py3-none-any.whl"
+                self.kodo_runner.copy_to_container(pod_name, chardet_path, dest_path)
+                self.execute_command(pod_name, f"python -m pip install {dest_path}")
             
             # Install required packages
             self.execute_command(pod_name, "python -m pip install chardet")
@@ -420,7 +448,7 @@ class PodManager:
             print(f"[PodManager] Error initializing SWE-bench pod {pod_name}: {e}")
             # Don't raise the exception as initialization failure shouldn't stop trajectory execution
             
-    def initialize_md_pod(self, pod_name: str, requirement_type: str = None, app_id: str = None):
+    def initialize_md_pod(self, pod_name: str, requirement_type: str = None, app_id: str = None, **kwargs):
         """
         Initialize SWE-bench pod environment with required setup commands.
         
@@ -436,11 +464,13 @@ class PodManager:
                 self.execute_command(pod_name, "ln -sf /data/shadcn/node_modules /workspace/node_modules")
                 self.execute_command(pod_name, f"mv /code-template/react-shadcn-lite-template /workspace/{app_id}")
                 
-            self.kodo_runner.copy_to_container(pod_name, "/mnt/cfs_bj_mt/workspace/tianlun-2/grpo_train/packages/chardet-3.0.0-py2.py3-none-any.whl", "/mnt/chardet-3.0.0-py2.py3-none-any.whl")
-            #解决reward部分计算错误
-#             self.kodo_runner.copy_to_container(pod_name, "/mnt/cfs_bj_mt/workspace/tianlun-2/grpo_train/tools/text_reward_model.py", "/workspace/text_reward_model/text_reward_model.py")
-            
-            self.execute_command(pod_name, "pip install /mnt/chardet-3.0.0-py2.py3-none-any.whl --break-system-packages")
+            #正常使用self.config.agent.chardet_path
+            chardet_path = os.os.getenv("CHARTDET_PATH", "")
+            if chardet_path:
+                self.kodo_runner.copy_to_container(pod_name, chardet_path, "/mnt/chardet-3.0.0-py2.py3-none-any.whl")
+                self.execute_command(pod_name, "pip install /mnt/chardet-3.0.0-py2.py3-none-any.whl --break-system-packages")
+            else:
+                self.execute_command(pod_name, "pip install chardet --break-system-packages")
             
             for command_path in MD_COMMAND_FILES:
                 #组合copy地址，去掉文件名称最后的.py部分

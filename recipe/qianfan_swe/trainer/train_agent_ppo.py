@@ -258,7 +258,6 @@ class TaskRunner:
 
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-#         tokenizer = hf_tokenizer("/mnt/cfs_bj_mt/models/opensource_checkpoints/DeepSeek-V3.1-Terminus", trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 

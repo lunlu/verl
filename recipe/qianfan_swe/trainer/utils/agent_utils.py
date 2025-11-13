@@ -56,6 +56,7 @@ AGENT_CLASSES = {
     "SweAgent": SweAgent,
     "SweToolsIcepopMessagesAgent": SweToolsIcepopMessagesAgent
 }
+MAX_RETRIES = 100
 
 
 def load_config_from_yaml(config_path: str):
@@ -129,7 +130,9 @@ def _create_agent(i, env_args, config):
     _args = env_args[i]
     app_id = _args.get("app_id", None)
     requirement_type = _args.get("requirement_type", None)
-    working_dir = config.agent.working_dir or "/testbed"
+    working_dir = _args.get("working_dir", "/testbed")
+    sample_type = _args.get("sample_source", "r2e")
+    print(f"[AgentUtils] current working_dir is {working_dir}, sample_type is {sample_type}")
     
     # Determine which agent class to use
     rollout_agent = config.agent.get("rollout_agent", "SweAgent")
@@ -138,7 +141,7 @@ def _create_agent(i, env_args, config):
     if rollout_agent not in AGENT_CLASSES:
         raise ValueError(f"Unknown agent class: {rollout_agent}. Supported classes: {list(AGENT_CLASSES.keys())}")
 
-    AgentClass = AGENT_CLASSES[rollout_agent]
+    AgentFactory = AGENT_CLASSES[rollout_agent]
     
     # Initialize pod based on environment type using PodManager
     if "docker_image" in _args:
@@ -152,10 +155,8 @@ def _create_agent(i, env_args, config):
     swebench_verified = "sweb" in docker_image
     #秒哒
     miaoda_task = "miaoda" in docker_image
-    if miaoda_task:
-        working_dir = f"/workspace/{app_id}"
-    print(f"[AgentUtils] current working_dir is {working_dir}")
-    for attempt in range(100):
+
+    for attempt in range(MAX_RETRIES):
         try:
             # Create independent PodManager for this agent
             pod_manager = PodManager(config=config)
@@ -166,7 +167,7 @@ def _create_agent(i, env_args, config):
         except Exception as e:
             print(f"[WARNING] Agent {i} create failed (attempt {attempt+1}): {e}")
             time.sleep(1 + attempt * 2)
-            if attempt == 99:
+            if attempt == MAX_RETRIES - 1:
                 raise RuntimeError(f"[PodManager] Agent {i} failed after retries, exception: {e}")
     
     image = pod_info["image"]
@@ -180,9 +181,9 @@ def _create_agent(i, env_args, config):
         print("[TrainingLogs] Using system prompt from system_yaml!")
 
         # Create agent using the configured agent class
-        agent = AgentClass(
+        agent = AgentFactory(
             max_rounds=config.agent.max_steps,
-            debug=False,
+            debug=config.agent.debug,
             termination_tool_names=config.agent.termination_tool_names,
             action_parser=parse_xml_action_custom,
             profiler=None,
@@ -217,9 +218,9 @@ def _create_agent(i, env_args, config):
         )
 
         # Create agent using the configured agent class
-        agent = AgentClass(
+        agent = AgentFactory(
             max_rounds=config.agent.max_steps,
-            debug=False,
+            debug=config.agent.debug,
             termination_tool_names=config.agent.termination_tool_names,
             action_parser=parse_xml_action_custom,
             profiler=None,
@@ -233,17 +234,7 @@ def _create_agent(i, env_args, config):
         agent.set_tools(base_tools)
     
     # Initialize pod based on environment type using PodManager
-    if swebench_verified:
-        # This is a SWE-bench environment, perform swebench initialization
-        print(f"[InitLogs] Initializing SWE-bench pod {pod_name}")
-        pod_manager.initialize_swebench_pod(pod_name)
-    elif miaoda_task:
-        print(f"[InitLogs] Initializing miaoda pod {pod_name}")
-        pod_manager.initialize_md_pod(pod_name, requirement_type=requirement_type, app_id=app_id)
-    else:
-        # This is an R2E environment, perform r2e initialization
-        print(f"[InitLogs] Initializing R2E pod {pod_name}")
-        pod_manager.initialize_r2e_pod(pod_name)
+    pod_manager.initialize_pod(pod_name, sample_type=sample_type, requirement_type=requirement_type, app_id=app_id)
 
     # Return the agent, pod name, image, and pod manager
     return i, pod_name, image, agent, pod_manager
