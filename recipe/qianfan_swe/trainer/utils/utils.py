@@ -70,8 +70,8 @@ def convert_messages_to_tokens_and_masks(messages: list[dict[str, str]], tokeniz
 
         # Remove the assistant token since it is contained in previous message as generation prompt
         if msg["role"] == "assistant":
-            assert msg_text.startswith(parser.assistant_token), f"Expected assistant token {parser.assistant_token} but got {msg_text}"
-            msg_text = msg_text.replace(parser.assistant_token, "")
+            if msg_text.startswith(parser.assistant_token):#, f"Expected assistant token {parser.assistant_token} but got {msg_text}"
+                msg_text = msg_text.replace(parser.assistant_token, "")
 
         msg_tokens = tokenizer.encode(msg_text, add_special_tokens=False)
         mask_value = 1 if msg["role"] == "assistant" else 0

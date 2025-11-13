@@ -86,6 +86,17 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+        
+        # Check if MoE logging is enabled (default: False if not present)
+        self.enable_moe_logging = self.config.get("enable_moe_logging", False)
+
+        # Check if IcePop is enabled (default: False if not present)
+        self.enable_icepop = self.config.get("enable_icepop", False)
+
+        # Check if TIS is enabled (default: False if not present)
+        self.enable_tis = self.config.get("enable_tis", False)
+        
+        self.current_global_step = "unknown"
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
@@ -296,6 +307,118 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.actor_optimizer.step()
         return grad_norm
+    
+    def _compute_tis_token_ratio(self, inf_log_probs, old_log_probs, response_mask, clip_threshold=1.2):
+        """
+        Compute Truncated Importance Sampling (TIS) ratio at TOKEN level for vanilla DAPO.
+        TIS corrects the mismatch between sampler (vLLM/inference) and learner (FSDP/training)
+        by computing per-token importance weights with upper-bound truncation.
+        Mathematical formulation:
+            ρ_t = π_sampler(a_t, θ_old) / π_learner(a_t, θ_old)
+            ρ̃_t = min(ρ_t, C)  (truncated at upper bound only)
+        This will be applied as a multiplicative factor to vanilla PPO's objective:
+            J_PPO+TIS = E[ρ̃_t * min(r_t*A_t, clip(r_t)*A_t)]
+        Key differences from sequence-level TIS (for GSPO):
+            - Operates at TOKEN level (one ratio per token, not per sequence)
+            - NO length-normalization (applied directly to each token)
+            - Applied outside PPO's min() operation, not inside
+        Paper references:
+            - TIS: https://fengyao.notion.site/off-policy-rl (TIS blog post)
+            - PPO: https://arxiv.org/abs/1707.06347 (PPO paper)
+        Args:
+            inf_log_probs: Log probs from inference engine (vLLM/sampler)
+                           Shape: [batch_size, response_length]
+            old_log_probs: Log probs from training engine (FSDP/learner old policy)
+                           Shape: [batch_size, response_length]
+            response_mask: Mask for valid tokens (1=valid, 0=padding)
+                           Shape: [batch_size, response_length]
+            clip_threshold: C parameter - truncate token ratios above this
+                            Default: 1.2 (more conservative than GSPO's 2.0-8.0)
+        Returns:
+            tis_token_ratio: Token-level TIS ratios (with stop-grad)
+                             Shape: [batch_size, response_length]
+            tis_stats: Dictionary with TIS statistics for logging
+        """
+        with torch.no_grad():
+            # 1. Token-level log ratio: log(π_sampler / π_learner)
+            #    inf_log_probs = sampler (vLLM inference backend)
+            #    old_log_probs = learner (FSDP training backend old policy)
+            log_ratio = inf_log_probs - old_log_probs  # [batch_size, response_length]
+
+            # 2. Convert to probability ratio
+            token_prob_ratio = torch.exp(log_ratio)  # [batch_size, response_length]
+
+            # 3. TIS: Truncate upper bound ONLY
+            #    - Keep ratios < 1 unchanged (unbiased for low-prob rollouts)
+            #    - Clip ratios > C to prevent gradient explosion
+            #    This is critical: unlike IcePop's double-sided clipping,
+            #    TIS only clips the upper bound
+            tis_token_ratio = torch.clamp(token_prob_ratio, max=clip_threshold)  # [batch_size, response_length]
+
+            # 4. Apply response mask (set padding tokens to 0)
+            tis_token_ratio = tis_token_ratio * response_mask
+
+            # 5. Compute statistics for monitoring (only on valid tokens)
+            valid_tokens = response_mask.sum().item()
+            clipped_tokens = ((token_prob_ratio > clip_threshold) * response_mask).sum().item()
+            clipping_freq = clipped_tokens / valid_tokens if valid_tokens > 0 else 0.0
+
+            # Mask-aware statistics
+            from verl.utils.torch_functional import masked_mean
+
+            # Ratio distribution
+            ratio_mean = masked_mean(token_prob_ratio, response_mask).item()
+            ratio_std_val = torch.sqrt(masked_mean((token_prob_ratio - ratio_mean) ** 2, response_mask)).item() if valid_tokens > 0 else 0.0
+            ratio_min = token_prob_ratio[response_mask.bool()].min().item() if valid_tokens > 0 else 0.0
+            ratio_max = token_prob_ratio[response_mask.bool()].max().item() if valid_tokens > 0 else 0.0
+            truncated_ratio_mean = masked_mean(tis_token_ratio, response_mask).item()
+
+            # Direction of mismatch (only count valid tokens)
+            ratio_lt_1 = ((token_prob_ratio < 1.0) * response_mask).sum().item()  # Sampler > Learner
+            ratio_gt_1 = ((token_prob_ratio >= 1.0) * response_mask).sum().item()  # Sampler <= Learner
+            ratio_gt_C = clipped_tokens  # Extreme mismatch (clipped)
+
+            # Track extreme mismatches
+            ratio_lt_0_5 = ((token_prob_ratio < 0.5) * response_mask).sum().item()  # Severe under-estimation
+            ratio_gt_1_5 = ((token_prob_ratio > 1.5) * response_mask).sum().item()  # Severe over-estimation
+
+            # Log-space statistics
+            masked_log_ratio = log_ratio * response_mask
+            log_ratio_mean = masked_log_ratio.sum().item() / valid_tokens if valid_tokens > 0 else 0.0
+            log_ratio_std = torch.sqrt(masked_mean((log_ratio - log_ratio_mean) ** 2, response_mask)).item() if valid_tokens > 0 else 0.0
+            log_ratio_min = log_ratio[response_mask.bool()].min().item() if valid_tokens > 0 else 0.0
+            log_ratio_max = log_ratio[response_mask.bool()].max().item() if valid_tokens > 0 else 0.0
+
+            tis_stats = {
+                # Clipping statistics
+                'tis_dapo/clipping_freq': clipping_freq,
+                'tis_dapo/clipped_tokens': clipped_tokens,
+                'tis_dapo/total_tokens': valid_tokens,
+
+                # Ratio distribution
+                'tis_dapo/ratio_mean': ratio_mean,
+                'tis_dapo/ratio_std': ratio_std_val,
+                'tis_dapo/ratio_min': ratio_min,
+                'tis_dapo/ratio_max': ratio_max,
+                'tis_dapo/truncated_ratio_mean': truncated_ratio_mean,
+
+                # Direction of mismatch
+                'tis_dapo/ratio_lt_1_count': ratio_lt_1,
+                'tis_dapo/ratio_gt_1_count': ratio_gt_1,
+                'tis_dapo/ratio_gt_C_count': ratio_gt_C,
+
+                # Extreme cases
+                'tis_dapo/ratio_lt_0.5_count': ratio_lt_0_5,
+                'tis_dapo/ratio_gt_1.5_count': ratio_gt_1_5,
+
+                # Log-space statistics (useful for debugging numerical issues)
+                'tis_dapo/log_ratio_mean': log_ratio_mean,
+                'tis_dapo/log_ratio_std': log_ratio_std,
+                'tis_dapo/log_ratio_min': log_ratio_min,
+                'tis_dapo/log_ratio_max': log_ratio_max,
+            }
+
+        return tis_token_ratio, tis_stats
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
@@ -318,6 +441,8 @@ class DataParallelPPOActor(BasePPOActor):
         """
         # set to eval
         self.actor_module.eval()
+        
+        self.current_global_step = data.meta_info.get("global_step", "unknown")
 
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
@@ -358,6 +483,87 @@ class DataParallelPPOActor(BasePPOActor):
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
 
         return log_probs, entropys
+    
+    def _compute_icepop_mask(self, inf_log_probs, old_log_probs, alpha=0.5, beta=2.0):
+        """
+        Compute IcePop double-sided masking to filter out noisy gradient updates.
+
+        The masking function M(k) where k = p_train / p_infer:
+        M(k) = { k  if k ∈ [α, β]
+               { 0  otherwise
+
+        Args:
+            inf_log_probs: Log probabilities from inference engine (vLLM), shape [batch_size, response_length]
+            old_log_probs: Log probabilities from training engine (FSDP old policy), shape [batch_size, response_length]
+            alpha: Lower bound for probability ratio (default: 0.5)
+            beta: Upper bound for probability ratio (default: 2.0)
+
+        Returns:
+            icepop_mask: Binary mask tensor, 1.0 for healthy updates, 0.0 for clipped tokens
+            clipping_stats: Dictionary with clipping statistics for logging
+        """
+        with torch.no_grad():
+            # Filter for model-generated tokens only (inf_log_probs != 0)
+            # inf_log_probs is padded with 0.0 for padding tokens
+            generated_token_mask = (inf_log_probs != 0.0)
+
+            # Convert log probabilities to probabilities
+            # p_train (old_log_probs) / p_infer (inf_log_probs) = exp(log_p_train - log_p_infer)
+            log_ratio = old_log_probs - inf_log_probs
+            prob_ratio = torch.exp(log_ratio)
+
+            # Apply double-sided clipping: keep only ratios in [alpha, beta]
+            # Mask out tokens where:
+            # 1. prob_ratio < alpha (training prob << inference prob - huge divergence)
+            # 2. prob_ratio > beta (training prob >> inference prob - overconfident)
+            icepop_mask = ((prob_ratio >= alpha) & (prob_ratio <= beta)).float()
+
+            # Compute clipping statistics only on model-generated tokens
+            total_tokens = generated_token_mask.sum().item()
+            clipped_tokens = ((icepop_mask == 0.0) & generated_token_mask).sum().item()
+            valid_tokens = (icepop_mask == 1.0).sum().item()
+            clipping_ratio = clipped_tokens / total_tokens if total_tokens > 0 else 0.0
+
+            # Analyze clipped vs non-clipped tokens (only model-generated)
+            clipped_lower = ((prob_ratio < alpha) & generated_token_mask).sum().item()  # Training prob too low
+            clipped_upper = ((prob_ratio > beta) & generated_token_mask).sum().item()   # Training prob too high
+
+            # Calculate mean probability ratios separately for <1 and >1 ratios
+            # Only compute on model-generated tokens
+            valid_mask = (icepop_mask == 1.0) & generated_token_mask
+            clipped_mask = (icepop_mask == 0.0) & generated_token_mask
+
+            # Separate underconfident (ratio < 1) and overconfident (ratio > 1) tokens
+            underconfident_mask = (prob_ratio < 1.0) & generated_token_mask
+            overconfident_mask = (prob_ratio >= 1.0) & generated_token_mask
+
+            # Valid ratios split
+            valid_underconfident = prob_ratio[(prob_ratio < 1.0) & valid_mask]
+            valid_overconfident = prob_ratio[(prob_ratio >= 1.0) & valid_mask]
+
+            # Clipped ratios split
+            clipped_underconfident = prob_ratio[(prob_ratio < 1.0) & clipped_mask]
+            clipped_overconfident = prob_ratio[(prob_ratio >= 1.0) & clipped_mask]
+
+            # Overall ratios split
+            all_underconfident = prob_ratio[underconfident_mask]
+            all_overconfident = prob_ratio[overconfident_mask]
+
+            clipping_stats = {
+                'icepop/clipped_ratio': clipping_ratio,
+                'icepop/clipped_lower': clipped_lower,
+                'icepop/clipped_upper': clipped_upper,
+                'icepop/clipped_tokens': clipped_tokens,
+                'icepop/total_tokens': total_tokens,
+                'icepop/valid_ratio_underconfident_mean': valid_underconfident.mean().item() if len(valid_underconfident) > 0 else 0.0,
+                'icepop/valid_ratio_overconfident_mean': valid_overconfident.mean().item() if len(valid_overconfident) > 0 else 0.0,
+                'icepop/clipped_ratio_underconfident_mean': clipped_underconfident.mean().item() if len(clipped_underconfident) > 0 else 0.0,
+                'icepop/clipped_ratio_overconfident_mean': clipped_overconfident.mean().item() if len(clipped_overconfident) > 0 else 0.0,
+                'icepop/prob_ratio_underconfident_mean': all_underconfident.mean().item() if len(all_underconfident) > 0 else 0.0,
+                'icepop/prob_ratio_overconfident_mean': all_overconfident.mean().item() if len(all_overconfident) > 0 else 0.0,
+            }
+
+        return icepop_mask, clipping_stats
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -387,13 +593,16 @@ class DataParallelPPOActor(BasePPOActor):
             
         if 'traj_mask' in data.batch:
             select_keys.append('traj_mask')
-
-            if 'is_pad_step' in data.non_tensor_batch:
-                is_pad_step = data.non_tensor_batch["is_pad_step"]
-                pad_step_indices = np.where(is_pad_step == True)[0]
-                if len(pad_step_indices) > 0:
-                    data.batch["advantages"][pad_step_indices] = 0
-
+        # Add inference log probs from vLLM for IcePop
+        if 'inf_log_probs' in data.batch:
+            select_keys.append('inf_log_probs')
+            
+        if 'is_pad_step' in data.non_tensor_batch:
+            is_pad_step = data.non_tensor_batch["is_pad_step"]
+            pad_step_indices = np.where(is_pad_step == True)[0]
+            if len(pad_step_indices) > 0:
+                data.batch["advantages"][pad_step_indices] = 0
+        
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
@@ -406,6 +615,10 @@ class DataParallelPPOActor(BasePPOActor):
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
+        logs_prob_list = []
+        old_logs_prob_list = []
+        advantage_list = []
+        response_mask_list = []
         
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
@@ -421,6 +634,8 @@ class DataParallelPPOActor(BasePPOActor):
                 self.actor_optimizer.zero_grad()
 
                 for micro_batch in micro_batches:
+                    data = micro_batch
+                    
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
@@ -432,6 +647,46 @@ class DataParallelPPOActor(BasePPOActor):
                     old_log_prob = model_inputs["old_log_probs"]
                     rollout_log_probs = model_inputs["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
                     advantages = model_inputs["advantages"]
+                    
+                    # Mismatch correction configuration
+                    # IcePop: Token-level double-sided masking
+                    USE_ICEPOP = self.enable_icepop  # Controlled by config
+                    ICEPOP_ALPHA = self.config.get("icepop_alpha", 0.5)  # Lower bound (symmetric 2x tolerance)
+                    ICEPOP_BETA = self.config.get("icepop_beta", 2.0)   # Upper bound (symmetric 2x tolerance)
+
+                    # TIS: Sequence-level importance weighting
+                    USE_TIS = self.enable_tis  # Controlled by config
+                    TIS_CLIP_THRESHOLD = self.config.get("tis_clip_threshold", 1.2)  # C parameter for TIS
+
+                    icepop_stats = {}
+                    tis_stats = {}
+
+
+                    if 'inf_log_probs' in model_inputs:
+                        inf_log_probs = model_inputs['inf_log_probs']
+
+                        # Apply IcePop (token-level masking)
+                        if USE_ICEPOP:
+                            icepop_mask, icepop_stats = self._compute_icepop_mask(
+                                inf_log_probs=inf_log_probs,
+                                old_log_probs=old_log_prob,
+                                alpha=ICEPOP_ALPHA,
+                                beta=ICEPOP_BETA
+                            )
+
+                            # Combine IcePop mask with response_mask (element-wise AND)
+                            response_mask = response_mask * icepop_mask
+
+                            if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+                                print(f"[IcePop] Step {self.current_global_step} - "
+                                      f"α={ICEPOP_ALPHA}, β={ICEPOP_BETA}, "
+                                      f"clipping_ratio={icepop_stats['icepop/clipped_ratio']:.4f} "
+                                      f"({icepop_stats['icepop/clipped_tokens']}/{icepop_stats['icepop/total_tokens']} tokens), "
+                                      f"lower={icepop_stats['icepop/clipped_lower']}, "
+                                      f"upper={icepop_stats['icepop/clipped_upper']}")
+                        else:
+                            # No IcePop, create a dummy all-ones mask
+                            icepop_mask = None
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
@@ -442,9 +697,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_scale_factor = 1 / self.gradient_accumulation
 
                     # all return: (bsz, response_length)
-                    calculate_entropy = False
-                    if entropy_coeff != 0:
-                        calculate_entropy = True
+                    calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
@@ -458,6 +711,27 @@ class DataParallelPPOActor(BasePPOActor):
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                    # Compute TIS based on loss_mode
+                    tis_seq_ratio = None   # For GSPO
+                    tis_token_ratio = None  # For vanilla DAPO
+
+                    if USE_TIS and 'inf_log_probs' in model_inputs:
+                        if "vanilla" in loss_mode:
+                            # Token-level TIS for vanilla DAPO
+                            tis_token_ratio, tis_stats = self._compute_tis_token_ratio(
+                                inf_log_probs=inf_log_probs,
+                                old_log_probs=old_log_prob,
+                                response_mask=response_mask,
+                                clip_threshold=TIS_CLIP_THRESHOLD
+                            )
+
+                            if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+                                print(f"[TIS-DAPO] Step {self.current_global_step} - "
+                                      f"C={TIS_CLIP_THRESHOLD}, "
+                                      f"clipping_freq={tis_stats['tis_dapo/clipping_freq']:.4f} "
+                                      f"({tis_stats['tis_dapo/clipped_tokens']}/{tis_stats['tis_dapo/total_tokens']} tokens), "
+                                      f"ratio_mean={tis_stats['tis_dapo/ratio_mean']:.4f}±{tis_stats['tis_dapo/ratio_std']:.4f}")
+                     
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                         old_log_prob=old_log_prob,
@@ -467,11 +741,24 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_log_probs=rollout_log_probs,
+                        tis_token_ratio=tis_token_ratio
                     )
-
+                    
+                    logs_prob_list.append(log_prob)
+                    old_logs_prob_list.append(old_log_prob)
+                    advantage_list.append(advantages)
+                    response_mask_list.append(response_mask)
+                    
+                    if entropy_coeff == 0:
+                        loss_agg_mode_entropy = 'token-mean'
+                    else:
+                        loss_agg_mode_entropy = loss_agg_mode
+                        
+                    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode_entropy)
+                    with torch.no_grad():
+                        entropy_token_mean_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode='token-mean')
+                        
                     if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
                         # compute policy loss
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
@@ -494,20 +781,42 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
+                        
                     loss.backward()
 
                     micro_batch_metrics.update(
                         {
+                            'actor/entropy_token_mean_loss': entropy_token_mean_loss.detach().item(),
+                            'actor/entropy_loss': entropy_loss.detach().item(),
                             "actor/pg_loss": pg_loss.detach().item() * loss_scale_factor,
                             "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                             "actor/ppo_kl": ppo_kl.detach().item(),
                             "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                         }
                     )
+                    # Add mismatch correction statistics if applied
+                    if icepop_stats:
+                        micro_batch_metrics.update(icepop_stats)
+                    if tis_stats:
+                        micro_batch_metrics.update(tis_stats)
+                        
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+                
+        logs_prob_list = torch.concat(logs_prob_list).detach().to('cpu').tolist()
+        old_logs_prob_list = torch.concat(old_logs_prob_list).detach().to('cpu').tolist()
+        advantage_list = torch.concat(advantage_list).detach().to('cpu').tolist()
+        response_mask_list = torch.concat(response_mask_list).detach().to('cpu').tolist()
+        metrics["logs_prob_list"] = logs_prob_list
+        metrics["old_logs_prob_list"] = old_logs_prob_list
+        metrics["advantage_list"] = advantage_list
+        metrics["response_mask_list"] = response_mask_list
+#         print(f"[TrainingLogs ] logs_prob_list is {logs_prob_list}")
+#         print(f"[TrainingLogs ] old_logs_prob_list is {old_logs_prob_list}")
+#         print(f"[TrainingLogs ] advantage_list is {advantage_list}")
+#         print(f"[TrainingLogs ] response_mask_list is {response_mask_list}")
         self.actor_optimizer.zero_grad()
         return metrics

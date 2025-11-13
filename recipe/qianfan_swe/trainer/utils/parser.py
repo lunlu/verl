@@ -1,3 +1,18 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2023-2024 SGLang Team
+# Copyright 2025 ModelBest Inc. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 This module defines chat template parsers for formatting messages for different LLMs.
 
@@ -17,6 +32,7 @@ Example:
     parser = LlamaChatTemplateParser(tokenizer)
     formatted = parser.parse(messages, add_generation_prompt=True)
 """
+import re
 
 PARSER_TEST_MESSAGES = [
     {"role": "system", "content": "You are a helpful assistant."},
@@ -73,28 +89,59 @@ class ChatTemplateParser:
         return is_equivalent
 
     @classmethod
-    def get_parser(cls, tokenizer, disable_thinking=False) -> "ChatTemplateParser":
+    def get_parser(cls, tokenizer, disable_thinking=False, parser_class=None) -> "ChatTemplateParser":
         """Factory method to get the appropriate parser based on a string identifier.
 
         Args:
-            parser_type (str): String identifier for the parser type
             tokenizer: The tokenizer to use with the parser
             disable_thinking: Whether generation prompt will disable thinking.
+            parser_class (str, optional): Explicit parser class name to use.
+                Supported values: "DeepseekV31TerminusSWEChatTemplateParser",
+                                 "DeepseekQwenChatTemplateParser",
+                                 "QwenChatTemplateParser",
+                                 "LlamaChatTemplateParser",
+                                 "ChatTemplateParser"
+                If None, auto-detect based on model name.
 
         Returns:
             ChatTemplateParser: An instance of the requested parser
 
         Raises:
-            ValueError: If the parser_type is not recognized
+            ValueError: If the parser_class is not recognized
         """
-        # Determine parser type based on tokenizer name or path
+        # If parser_class is explicitly specified, use it
+        if parser_class:
+            parser_class_lower = parser_class.lower()
+
+            if parser_class_lower == "deepseekv31terminusswechattemplateparser":
+                print(f"Using explicitly specified DeepseekV31TerminusSWEChatTemplateParser")
+                return DeepseekV31TerminusSWEChatTemplateParser(tokenizer, disable_thinking=disable_thinking)
+            elif parser_class_lower == "deepseekqwenchattemplateparser":
+                print(f"Using explicitly specified DeepseekQwenChatTemplateParser")
+                model_name = tokenizer.name_or_path.lower() if isinstance(tokenizer.name_or_path, str) else ""
+                return DeepseekQwenChatTemplateParser(tokenizer, disable_thinking=disable_thinking, model_name=model_name)
+            elif parser_class_lower == "qwenchattemplateparser":
+                print(f"Using explicitly specified QwenChatTemplateParser")
+                return QwenChatTemplateParser(tokenizer, disable_thinking=disable_thinking)
+            elif parser_class_lower == "llamachattemplateparser":
+                print(f"Using explicitly specified LlamaChatTemplateParser")
+                return LlamaChatTemplateParser(tokenizer)
+            elif parser_class_lower == "chattemplateparser":
+                print(f"Using explicitly specified ChatTemplateParser")
+                return ChatTemplateParser(tokenizer)
+            else:
+                raise ValueError(f"Unknown parser_class: {parser_class}. Supported values: "
+                               "DeepseekV31TerminusSWEChatTemplateParser, DeepseekQwenChatTemplateParser, "
+                               "QwenChatTemplateParser, LlamaChatTemplateParser, ChatTemplateParser")
+
+        # Auto-detect based on tokenizer name or path
         if isinstance(tokenizer.name_or_path, str):
             model_name = tokenizer.name_or_path.lower()
             tokenizer_cls = tokenizer.__class__.__name__.lower()
             print(f"model_name: {model_name}, tokenizer_cls: {tokenizer_cls}")
             if any(x in model_name for x in ("deepseek", "deepscaler", "deepcoder")) and "llama" in tokenizer_cls:
                 print(f"Using DeepseekQwenChatTemplateParser for {tokenizer.name_or_path}")
-                return DeepseekQwenChatTemplateParser(tokenizer)
+                return DeepseekQwenChatTemplateParser(tokenizer, disable_thinking=disable_thinking, model_name=model_name)
             elif "qwen" in model_name or "r2e" in model_name or "deepswe" in model_name or "qwen" in tokenizer_cls:
                 print(f"Using QwenChatTemplateParser for {tokenizer.name_or_path}")
                 return QwenChatTemplateParser(tokenizer, disable_thinking=disable_thinking)
@@ -110,20 +157,26 @@ class ChatTemplateParser:
 
 
 class DeepseekQwenChatTemplateParser(ChatTemplateParser):
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, disable_thinking=True, model_name=""):
         super().__init__(tokenizer)
         self.bos_token = tokenizer.bos_token
         self.eos_token = tokenizer.eos_token
         self.system_token = ""
         self.user_token = "<｜User｜>"
         self.assistant_token = "<｜Assistant｜>"
-        self.generation_prompt = self.eos_token + self.assistant_token + "<think>\n"
+        self.generation_prompt = self.eos_token + self.assistant_token
+        if disable_thinking:
+            if "v3.1" in model_name.lower():
+                self.generation_prompt += "</think>"
+        else:
+            self.generation_prompt += "<think>"
 
     def parse(self, messages, add_generation_prompt=False, is_first_msg=False, **kwargs) -> str:
         result = ""
 
         if is_first_msg:
             result += self.bos_token
+            generation_prompt = self.generation_prompt
 
         for message in messages:
             if message["role"] == "system":
@@ -147,6 +200,201 @@ class DeepseekQwenChatTemplateParser(ChatTemplateParser):
 
     def parse_assistant(self, message):
         return self.assistant_token + message["content"] + self.eos_token
+
+
+class DeepseekV31TerminusSWEChatTemplateParser(ChatTemplateParser):
+    """Parser for DeepSeek-V3.1-Terminus model following the official chat template.
+
+    This parser implements the chat template from tokenizer_config.json which includes:
+    - System messages collected at the beginning
+    - User/Assistant conversation flow
+    - Tool calls with special markers
+    - Tool outputs handling
+    - Thinking tag support
+    """
+    def __init__(self, tokenizer, disable_thinking=True):
+        super().__init__(tokenizer)
+        self.bos_token = "<｜begin▁of▁sentence｜>"
+        self.eos_token = "<｜end▁of▁sentence｜>"
+        self.user_token = "<｜User｜>"
+        self.assistant_token = "<｜Assistant｜>"
+
+        # Tool-related tokens
+        self.tool_calls_begin = "<｜tool▁calls▁begin｜>"
+        self.tool_calls_end = "<｜tool▁calls▁end｜>"
+        self.tool_call_begin = "<｜tool▁call▁begin｜>"
+        self.tool_call_end = "<｜tool▁call▁end｜>"
+        self.tool_sep = "<｜tool▁sep｜>"
+        self.tool_output_begin = "<｜tool▁output▁begin｜>"
+        self.tool_output_end = "<｜tool▁output▁end｜>"
+
+        # Thinking tag
+        self.disable_thinking = disable_thinking
+        if disable_thinking:
+            self.generation_prompt = self.assistant_token + "</think>"
+        else:
+            self.generation_prompt = self.assistant_token + "<think>"
+
+    def _parse_tool_calls_from_content(self, content):
+        """
+        Parse tool calls from content using regex.
+
+        Returns:
+            tuple: (has_tools, text_before_tools)
+                - has_tools: bool indicating if valid tool calls were found and parsed
+                - text_before_tools: text content before tool calls (or entire content if no tools)
+        """
+        # Pattern to match the complete tool calls section
+        tool_calls_pattern = re.escape(self.tool_calls_begin) + r'(.*?)' + re.escape(self.tool_calls_end)
+        match = re.search(tool_calls_pattern, content, re.DOTALL)
+
+        if not match:
+            return False, content
+
+        # Extract text before tool calls
+        tool_calls_start = match.start()
+        text_before = content[:tool_calls_start].strip()
+
+        # Extract the tool calls section
+        tool_section = match.group(1)
+
+        # Verify we have at least one valid tool call inside
+        # Pattern: <｜tool▁call▁begin｜>function_name<｜tool▁sep｜>arguments<｜tool▁call▁end｜>
+        tool_call_pattern = re.escape(self.tool_call_begin) + r'(.*?)' + re.escape(self.tool_sep) + r'(.*?)' + re.escape(self.tool_call_end)
+        tool_calls = re.findall(tool_call_pattern, tool_section, re.DOTALL)
+
+        if tool_calls:
+            # Successfully found valid tool calls
+            return True, text_before if text_before else None
+
+        return False, content
+
+    def parse(self, messages, add_generation_prompt=False, is_first_msg=False, **kwargs) -> str:
+        result = ""
+
+        # Collect all system messages at the beginning
+        system_prompt = ""
+        is_first_sp = True
+        for message in messages:
+            if message["role"] == "system":
+                if is_first_sp:
+                    system_prompt = message["content"]
+                    is_first_sp = False
+                else:
+                    system_prompt += "\n\n" + message["content"]
+
+        # Add BOS token and system prompt if this is the first message
+        if is_first_msg:
+            result += self.bos_token + system_prompt
+
+        # Track state
+        is_last_user = False
+        is_tool = False
+        expect_tool_response = False  # Track if previous assistant had tool calls
+
+        # Process messages
+        for message in messages:
+            role = message["role"]
+
+            if role == "system":
+                # System messages already handled
+                continue
+
+            elif role == "user":
+                # If previous assistant had tool calls, treat this user message as tool response
+                if expect_tool_response:
+                    is_last_user = False
+                    is_tool = True
+                    result += self.tool_output_begin + message["content"] + self.tool_output_end
+                    expect_tool_response = False
+                else:
+                    is_tool = False
+                    is_last_user = True
+                    result += self.user_token + message["content"]
+
+            elif role == "assistant":
+                content = message.get("content", "")
+
+                # First check if tool_calls field exists (parsed structure)
+                tool_calls = message.get("tool_calls")
+
+                # If no tool_calls field, try to parse from content
+                has_tools_in_content = False
+                text_before_tools = None
+                if not tool_calls:
+                    has_tools_in_content, text_before_tools = self._parse_tool_calls_from_content(content)
+
+                if tool_calls:
+                    # Assistant message with parsed tool_calls structure
+                    if is_last_user:
+                        result += self.assistant_token + "</think>"
+                    is_last_user = False
+                    is_tool = False
+
+                    # Add content if present, then tool calls
+                    if content:
+                        result += content
+
+                    result += self.tool_calls_begin
+                    for tool in tool_calls:
+                        func_name = tool["function"]["name"]
+                        func_args = tool["function"]["arguments"]
+                        result += self.tool_call_begin + func_name + self.tool_sep + func_args + self.tool_call_end
+                    result += self.tool_calls_end + self.eos_token
+
+                    # Mark that we expect a tool response next
+                    expect_tool_response = True
+
+                elif has_tools_in_content:
+                    # Successfully parsed tool calls from content
+                    if is_last_user:
+                        result += self.assistant_token + "</think>"
+                    is_last_user = False
+                    is_tool = False
+
+                    # Content already contains the tool calls, just append it
+                    result += content
+
+                    # Add eos_token if not already present at the end
+                    if not content.endswith(self.eos_token):
+                        result += self.eos_token
+
+                    # Mark that we expect a tool response next
+                    expect_tool_response = True
+
+                else:
+                    # Regular assistant message without tool calls
+                    if is_last_user:
+                        result += self.assistant_token
+                        # Handle thinking tag based on prefix or disable_thinking
+                        if message.get("prefix") and not self.disable_thinking:
+                            result += "<think>"
+                        else:
+                            result += "</think>"
+                    is_last_user = False
+
+                    # Remove </think> tag if present in content
+                    if "</think>" in content:
+                        content = content.split("</think>", 1)[1]
+
+                    result += content + self.eos_token
+                    is_tool = False
+                    expect_tool_response = False
+
+            elif role == "tool":
+                is_last_user = False
+                is_tool = True
+                result += self.tool_output_begin + message["content"] + self.tool_output_end
+                expect_tool_response = False
+
+            else:
+                raise NotImplementedError(f"Unsupported message role: {role}")
+
+        # Add generation prompt if requested
+        if add_generation_prompt and is_last_user and not is_tool:
+            result += self.generation_prompt
+
+        return result
 
 
 class QwenChatTemplateParser(ChatTemplateParser):

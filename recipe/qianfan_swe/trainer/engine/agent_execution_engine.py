@@ -23,12 +23,12 @@ import time
 import traceback
 import uuid
 import json
+import torch
 from concurrent.futures import ThreadPoolExecutor
 
 import sys
 import os
 import numpy as np
-import torch
 from contextlib import contextmanager
 
 from recipe.qianfan_swe.trainer.utils.utils import (
@@ -179,13 +179,15 @@ class AgentExecutionEngine:
         if chat_parser is None:
             # Try to import and initialize chat parser
             try:
-                self.chat_parser = ChatTemplateParser.get_parser(self.tokenizer, disable_thinking=kwargs.get("disable_thinking", False))
+                self.chat_parser = ChatTemplateParser.get_parser(self.tokenizer, disable_thinking=kwargs.get("disable_thinking", False), parser_class=kwargs.get("parser_class", False))
             except ImportError:
                 # Fallback to a simple parser if not available
                 self.chat_parser = None
                 print("Warning: ChatTemplateParser not available, using fallback")
         else:
             self.chat_parser = chat_parser
+            
+        self.inf_logprobs_cache = {}
 
 
     async def get_model_response(self, messages, application_id, **kwargs):
@@ -255,6 +257,11 @@ class AgentExecutionEngine:
             batch.meta_info["max_tokens"] = kwargs["max_tokens"]
 
         output = await self.router.generate_sequences(batch, application_id=application_id, **kwargs)
+        
+        # Extract inference log probs for IcePop if available
+        inf_log_probs = None
+        if "inf_log_probs" in output.batch:
+            inf_log_probs = output.batch["inf_log_probs"][0]  # Shape: (response_length,)
 
         attn = output.batch["attention_mask"][0, self.max_prompt_length :]
         tokens = output.batch["responses"][0]
@@ -263,16 +270,23 @@ class AgentExecutionEngine:
         non_pad_indices = (attn == 1).nonzero(as_tuple=True)[0]
         if len(non_pad_indices) == 0:
             trimmed = tokens[:0]  # empty
+            trimmed_log_probs = None
         else:
             last_valid_idx = non_pad_indices[-1].item()
             trimmed = tokens[: last_valid_idx + 1]  # include the last valid token
+            # Trim log probs to match trimmed tokens
+            if inf_log_probs is not None:
+                trimmed_log_probs = inf_log_probs[: last_valid_idx + 1]
+            else:
+                trimmed_log_probs = None
 
         response = self.tokenizer.decode(trimmed, skip_special_tokens=False)
 
         pad_token = self.tokenizer.pad_token
         eos_token = self.tokenizer.eos_token
         response = response.replace(pad_token, "").replace(eos_token, "")
-        return response
+
+        return response, trimmed_log_probs, trimmed
 
     async def run_agent_trajectory_async(self, idx, application_id, seed=0, mode="Text", **kwargs):
         """Run a single agent's trajectory asynchronously"""
@@ -290,6 +304,7 @@ class AgentExecutionEngine:
             response_token_len = 0
             response_tokens = []
             response_masks = []
+            response_token_types = []  # Track which tokens are assistant (1) vs environment (0)
             total_time = 0.0
             llm_time = 0.0
             env_time = 0.0
@@ -298,26 +313,19 @@ class AgentExecutionEngine:
 
             # for step return
             episode_steps = []
+            # Store inference log probs for each step (for IcePop)
+            inference_log_probs_list = []
 
             prompt = self.raw_prompts[idx]
-            # Extract the first user message from prompt
-            if isinstance(prompt, list) and len(prompt) > 0:
-                for msg in prompt:
-                    if msg.get("role") == "user":
-                        prompt = msg.get("content", "")
-                        break
-            elif isinstance(prompt, dict):
-                prompt = prompt.get("content", "")
-            elif not isinstance(prompt, str):
-                prompt = str(prompt)
+
             # Reset environment with the task using the executor
             loop = asyncio.get_event_loop()
 
             # Start timing for the entire trajectory
             trajectory_start_time = time.time()
-            
+            inference_log_probs_list = []
             try:
-                trajectory_result = await asyncio.wait_for(
+                results = await asyncio.wait_for(
                     agent.run_trajectory(
                         prompt=prompt,
                         llm_generate_func=self._get_verl_async,
@@ -335,6 +343,11 @@ class AgentExecutionEngine:
                     ),
                     timeout=(self.trajectory_timeout*2)
                 )
+                if isinstance(results, tuple):
+                    trajectory_result, inference_log_probs_list = results
+                else:
+                    trajectory_result = results
+                    
                 total_time = time.time() - trajectory_start_time
                 
                 termination_reason = trajectory_result.metadata["stop_reason"]
@@ -372,12 +385,12 @@ class AgentExecutionEngine:
                 result_messages = agent._add_steps_remaining(result_messages, 0)
             print(f"[TrainingLogs] current result_messages is {result_messages}")
 
-            # 获取第一个user消息以及之前的所有内容
+            # 获取第一个assistant之前的所有内容
             init_messages = []
             for mes in result_messages:
-                init_messages.append(mes)
-                if mes["role"] == "user":
+                if mes["role"] == "assistant":
                     break
+                init_messages.append(mes)
 
             # result_messages取剩下的内容
             response_messages = result_messages[len(init_messages): ]
@@ -398,10 +411,27 @@ class AgentExecutionEngine:
 
             response_tokens = []
             response_masks = []
+            
+            assistant_index = 0
             for msg in response_messages:
                 if self.chat_parser:
                     if msg["role"] == "assistant":
                         response_token, response_mask = convert_messages_to_tokens_and_masks([msg], tokenizer=self.tokenizer, parser=self.chat_parser, contains_first_msg=False, contains_generation_msg=False)
+                        if inference_log_probs_list:
+                            step_inf_log_probs = inference_log_probs_list[assistant_index]
+                        else:
+                            step_inf_log_probs = None
+                        if step_inf_log_probs is not None and len(response_token) != step_inf_log_probs.shape[0]:
+                            if step_inf_log_probs.shape[0] > len(response_token):
+                                # Trim logprobs to match re-tokenized length
+                                aligned_logprobs = step_inf_log_probs[:len(response_token)]
+                                inference_log_probs_list[assistant_index] = aligned_logprobs
+                            elif step_inf_log_probs.shape[0] < len(response_token):
+                                # Pad logprobs to handle off-by-1 case
+                                padding_size = len(response_token) - step_inf_log_probs.shape[0]
+                                aligned_logprobs = torch.nn.functional.pad(step_inf_log_probs, (0, padding_size), value=0.0)
+                                inference_log_probs_list[assistant_index] = aligned_logprobs
+                        assistant_index += 1
                     else:
                         response_token, response_mask = convert_messages_to_tokens_and_masks([msg], tokenizer=self.tokenizer, parser=self.chat_parser, contains_first_msg=False, contains_generation_msg=True)
                     response_tokens.extend(response_token)
@@ -410,6 +440,7 @@ class AgentExecutionEngine:
                     raise Exception(f"[TrajectoryLogs] No chat parser found, cannot tokenize response")
                     
             response_token_len = len(response_tokens)
+            response_token_types = response_masks.copy()
             
             # Check for response truncation
             if response_token_len > self.max_response_length:
@@ -418,8 +449,29 @@ class AgentExecutionEngine:
                 # Truncate tokens and masks
                 response_tokens = response_tokens[:self.max_response_length]
                 response_masks = response_masks[:self.max_response_length]
+                response_token_types = response_token_types[:self.max_response_length]
                 response_token_len = len(response_tokens)
                 print(f"[TrajectoryLogs] Response length truncated from {original_len} to {response_token_len}")
+            
+            valid_logprobs = [lp for lp in inference_log_probs_list if lp is not None]
+            traj_inf_log_probs = None
+            if valid_logprobs:
+                # Concatenate vLLM logprobs (assistant tokens only)
+                vllm_inf_log_probs = torch.cat(valid_logprobs, dim=0)
+                vllm_inf_log_probs = vllm_inf_log_probs[: response_token_len]
+                # Create padded version matching response_tokens length
+                # response_token_types: 1=assistant, 0=environment
+                padded_inf_log_probs = torch.zeros(len(response_tokens), dtype=torch.float32)
+
+                # Fill assistant positions with vLLM logprobs
+                assistant_positions = [i for i, t in enumerate(response_token_types) if t == 1]
+
+                # Handle potential length mismatch
+                num_to_fill = min(len(assistant_positions), vllm_inf_log_probs.shape[0])
+                for i in range(num_to_fill):
+                    padded_inf_log_probs[assistant_positions[i]] = vllm_inf_log_probs[i]
+
+                traj_inf_log_probs = padded_inf_log_probs
 
             masked_out = False
             if self.overlong_filter:
@@ -430,6 +482,7 @@ class AgentExecutionEngine:
                     print(f"[TrajectoryLogs] Trajectory masked out due to overlong filter. Reason: {termination_reason}")
 
             # Calculate reward using PodManager (only if not already set to 0 due to truncation/timeout)
+            reward_info = ""
             if not masked_out:
                 reward = await loop.run_in_executor(self.executor,
                                                     self._calculate_reward_with_pod_manager, 
@@ -437,6 +490,9 @@ class AgentExecutionEngine:
                                                     pod_name, 
                                                     self.extra_infos[idx]
                 )
+                if isinstance(reward, list) or isinstance(reward, tuple):
+                    reward_info = reward[1]
+                    reward = reward[0]
             
             # Log termination information
             if termination_reason:
@@ -452,6 +508,7 @@ class AgentExecutionEngine:
                 "prompt_tokens": torch.tensor(prompt_tokens, dtype=torch.long),
                 "response_tokens": torch.tensor(response_tokens, dtype=torch.long),
                 "response_masks": torch.tensor(response_masks, dtype=torch.long),
+                "inf_log_probs": traj_inf_log_probs,
                 "trajectory_reward": reward,
                 "docker": self.images[idx],
                 "idx": idx,
@@ -466,6 +523,7 @@ class AgentExecutionEngine:
                     # Token length information
                     "prompt_token_len": prompt_token_len,
                     "response_token_len": response_token_len,
+                    "reward_info": reward_info
                 },
             }
             return token_result
@@ -513,7 +571,7 @@ class AgentExecutionEngine:
         """
         for ind in range(self.retry_limit):
             try:
-                return await asyncio.wait_for(self.run_agent_trajectory_async(idx, application_id=application_id, seed=seed, mode=mode, **kwargs), timeout=7200)
+                return await asyncio.wait_for(self.run_agent_trajectory_async(idx, application_id=application_id, seed=seed, mode=mode, **kwargs), timeout=5400)
             except Exception as e:
                 stack_trace = traceback.format_exc()
                 print(f"[TrainingLogs] func run_agent_trajectory_with_retry, generate trajectory error, error msg is {e}, response params is idx: {idx}, application_id: {application_id}, mode: {mode}, kwargs: {kwargs}, corresponding traceback code is : {stack_trace}, retry is {ind}/{self.retry_limit}")
@@ -730,15 +788,30 @@ class AgentExecutionEngine:
             # Determine environment type based on env attributes
             if not ds:
                 raise ValueError("Cannot find dataset (ds) in environment")
-                
+            
+            sample_type = ds.get("sample_type", "r2e")
             # Check if it's swebench verified
-            docker_image = ds["docker_image"] if "docker_image" in ds else ""
-            swebench_verified = "sweb" in docker_image
+            if "docker_image" in ds:
+                docker_image = ds.get("docker_image", "")
+            elif "docker" in ds:
+                docker_image = ds.get("docker", "")
+            else:
+                raise Exception("[TrainingLogs] please provide docker or docker_image in sample!")
+                
+            print(f"[TrainingLogs] current sample type is {sample_type}, docker_image is {docker_image}")
+            
+            swebench_verified = sample_type.lower() == "swebench"
+            miaoda_task = sample_type.lower() == "md"
+            r2e_task = sample_type.lower() == "r2e"
             
             if swebench_verified:
                 return self._calculate_reward_swebench_pod_manager(pod_manager, pod_name, ds, "/", timeout=300)
-            else:
+            elif miaoda_task:
+                return self._calculate_reward_miaoda_pod_manager(pod_manager, pod_name, ds, "/workspace", timeout=300)
+            elif r2e_task:
                 return self._calculate_reward_r2e_pod_manager(pod_manager, pod_name, ds, "/root", timeout=300)
+            else:
+                print(f"[TrainingLogs] sample type only support `r2e/swebench/md`, but get {sample_type}, docker_image is {docker_image}")
                 
         except Exception as e:
             print(f"[RewardLogs] Error calculating reward: {e}")
@@ -757,7 +830,7 @@ class AgentExecutionEngine:
             
             from swebench.harness.test_spec.test_spec import make_test_spec, TestSpec
             # Run tests using PodManager
-            output, exit_code = pod_manager.execute_command(pod_name, f"bash {alt_path}/run_tests.sh", timeout)
+            output, exit_code = pod_manager.execute_command(pod_name, f"timeout {timeout} bash {alt_path}/run_tests.sh", timeout)
             
             test_spec = make_test_spec(ds)
             # Get test spec from environment
@@ -787,6 +860,53 @@ class AgentExecutionEngine:
         except Exception as e:
             print(f"[RewardLogs] Error in _calculate_reward_swebench_pod_manager: {e}")
             return 0.0
+        
+    def _calculate_reward_miaoda_pod_manager(self, pod_manager, pod_name, ds, alt_path, timeout):
+        """Calculate reward for R2E environments using PodManager"""
+        output = None
+        try:
+            _, _ = pod_manager.execute_command(pod_name, f"timeout {timeout} chmod +x /workspace/text_reward_model/run.sh")
+            other_info = ds.get("other_info", {})
+            app_id = other_info.get("app_id", None)
+            prd = other_info.get("PRD", None)
+            function_list = other_info.get("function_list", None)
+            func_num = len(function_list)
+            # 方法1：转义单引号（推荐）
+            func_json = json.dumps(function_list, ensure_ascii=False)
+            func_escaped = func_json.replace("'", "'\"'\"'")
+            exec_command = f"""unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && timeout 300 bash /workspace/text_reward_model/run.sh --qid "2" --prd_id "825" --repo_path /workspace/{app_id} --prd_description "{prd}" --func_list '{func_escaped}'"""
+
+            # 使用heredoc写入文件
+            heredoc_cmd = f"""cat > /workspace/test.sh << 'EOF'
+            {exec_command}
+            EOF"""
+
+            output, error_code = pod_manager.execute_command(pod_name, heredoc_cmd)
+            print(f"[RewardLogs] current pod name is {pod_name}, input is {exec_command}")
+
+            exec_command = f"timeout {timeout} bash /workspace/test.sh"
+            output, error_code = pod_manager.execute_command(pod_name, exec_command)
+            print(f"[RewardLogs] current pod name is {pod_name}, input is {str(heredoc_cmd)}/{output}, error_code is {error_code}")
+            
+            # Run tests using PodManager
+            output, error_code = pod_manager.execute_command(pod_name, f"""timeout {timeout} """ + """cat /workspace/text_reward_model/result_dir/result_score.jsonl""")
+            print(f"[RewardLogs] current pod name is {pod_name}, get result_score, result is {output}, error_code is {error_code}")
+            if float(error_code) != 0:
+                print(f"[RewardLogs] current pod name is {pod_name}, get result_score error, result is {output}, error_code is {error_code}")
+                reward = 0
+            else:
+                scores = []
+                for func in output.strip().split("\n"):
+                    function_score = json.loads(func)
+                    scores.append(function_score["function_score"])
+                reward = sum(scores) / func_num
+            print(f"[RewardLogs] miaoda reward calculation: final reward={reward}, ori reward is {output}")
+            return reward, "success"
+            
+        except Exception as e:
+            stack_trace = traceback.format_exc()
+            print(f"[RewardLogs] Error in _calculate_reward_miaoda_pod_manager: {e}, pod_name is {pod_name}, output is {output}")
+            return 0.0, "error"
 
     def _calculate_reward_r2e_pod_manager(self, pod_manager, pod_name, ds, alt_path, timeout):
         """Calculate reward for R2E environments using PodManager"""

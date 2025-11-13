@@ -866,6 +866,7 @@ def compute_policy_loss_vanilla_v2(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_log_probs=None,
+    tis_token_ratio: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -920,6 +921,9 @@ def compute_policy_loss_vanilla_v2(
 
     # Remove the dual-clip PPO for now... (there's no evidence it improves performance)
     pg_losses = clip_pg_losses1 #torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    
+    if tis_token_ratio is not None:
+        pg_losses = pg_losses * tis_token_ratio  # Element-wise multiplication [batch_size, response_length]
 
     # Statistics tracked for PPO.
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)

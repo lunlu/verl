@@ -359,17 +359,21 @@ class AsyncvLLMServer(AsyncServerBase):
         """
         request_json = await raw_request.json()
         request = CompletionRequest(**request_json)
+        import time
+        st = time.time()
         generator = await self.openai_serving_completion.create_completion(request, raw_request)
+        et = time.time()
+        print(f"[VllmAsyncServerLogs] current request cost time is {et - st}")
         if isinstance(generator, ErrorResponse):
             return JSONResponse(content=generator.model_dump(), status_code=generator.code)
         if request.stream:
             return StreamingResponse(content=generator, media_type="text/event-stream")
         else:
             assert isinstance(generator, CompletionResponse)
-            if generator.choices and generator.choices[0].logprobs:
-                generator.choices[0].logprobs.token_logprobs = [] 
-                generator.choices[0].logprobs.top_logprobs = []
-                generator.choices[0].logprobs.text_offset = []
+#             if generator.choices and generator.choices[0].logprobs:
+#                 generator.choices[0].logprobs.token_logprobs = [] 
+#                 generator.choices[0].logprobs.top_logprobs = []
+#                 generator.choices[0].logprobs.text_offset = []
             return JSONResponse(content=generator.model_dump())
 
     async def generate(

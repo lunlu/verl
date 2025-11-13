@@ -56,6 +56,7 @@ from functools import reduce
 from pprint import pprint
 from queue import Queue
 from threading import Thread
+from collections import defaultdict
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -153,15 +154,13 @@ class AgentPPOTrainer(RayPPOTrainer):
         full_agent_args = dict(self.config.agent.get("agent_args", {})) | self.agent_args
         base_env_args = dict(self.config.env.get("env_args", {})) | self.env_args
 
-        print(f"env_args len is {len(env_args)}")
-
         env_args = [json.loads(_args) for _args in env_args]
         agents = [None] * len(env_args)
         pod_names = [None] * len(env_args)
         images = [None] * len(env_args)
         pod_managers = [None] * len(env_args)
         
-        with ThreadPoolExecutor(max_workers=64) as executor:
+        with ThreadPoolExecutor(max_workers=16) as executor:
             agent_futures = [executor.submit(_create_agent, i, env_args, self.config) for i in range(len(env_args))]
             for future in as_completed(agent_futures):
                 idx, pod_name, image, agent, pod_manager = future.result()
@@ -295,6 +294,7 @@ class AgentPPOTrainer(RayPPOTrainer):
 
                         # recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw):
+                            batch.meta_info["global_step"] = self.global_steps
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                             batch = batch.union(old_log_prob)
 
@@ -349,9 +349,26 @@ class AgentPPOTrainer(RayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw):
+                            batch.meta_info["global_step"] = self.global_steps
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         
-                        metrics = actor_output.meta_info["metrics"]
+                        logs_prob_list = None
+                        old_logs_prob_list = None
+                        advantage_list = None
+                        response_mask_list = None
+                        metrics_ = actor_output.meta_info["metrics"]
+                        if "logs_prob_list" in metrics_:
+                            logs_prob_list = metrics_["logs_prob_list"]
+                            del metrics_["logs_prob_list"]
+                        if "old_logs_prob_list" in metrics_:
+                            old_logs_prob_list = metrics_["old_logs_prob_list"]
+                            del metrics_["old_logs_prob_list"]
+                        if "advantage_list" in metrics_:
+                            advantage_list = metrics_["advantage_list"]
+                            del metrics_["advantage_list"]
+                        if "response_mask_list" in metrics_:
+                            response_mask_list = metrics_["response_mask_list"]
+                            del metrics_["response_mask_list"]
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
@@ -362,12 +379,16 @@ class AgentPPOTrainer(RayPPOTrainer):
                         with marked_timer("dump_rollout_generations", timing_raw):
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=False)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=False)
+                            old_prob = batch.batch["old_log_probs"].cpu().tolist()
                             #判断是否使用了参考模型
                             ref_log_prob = None
                             if "ref_log_prob" in list(batch.batch.keys()):
                                 ref_log_prob = batch.batch["ref_log_prob"].cpu().tolist()
+                            advantages = batch.batch["advantages"].cpu().tolist()
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                            response_mask = batch.batch["response_mask"].cpu().tolist()
                             reward_extra_infos_dict = {}
+                            #仅当actor.use_dynamic_bsz=False的情况下logs_prob_list/old_logs_prob_list/advantage_list/response_mask_list可以与inputs/outputs/scores等对齐顺序，否则不对齐
                             self._dump_generations(
                                 inputs=inputs,
                                 outputs=outputs,
@@ -553,18 +574,25 @@ class AgentPPOTrainer(RayPPOTrainer):
             DataProto: A structured dataset containing input tokens, masks, and rewards.
         """
         from verl.utils.torch_functional import pad_sequence_to_length
+        
+        # Generate UUIDs for trajectory linking with MoE data
+        trajectory_uuids = [str(uuid.uuid4()) for _ in trajectories]
 
         all_initial_tokens_list = []
         all_response_tokens_list = []
         all_masks_list = []
+        all_inf_log_probs_list = []  # Store inference log probs from vLLM (Token mode)
         traj_scores = []
         chat_completions = []
         traj_metrics = []
         metrics = {}
+        termination_reason_rato = defaultdict(int)
         
         down_infos = []
 
-        for traj in trajectories:
+        for i, traj in enumerate(trajectories):
+            trajectory_uuid = trajectory_uuids[i]  # Get UUID for this trajectory
+            
             prompt_tokens = traj["prompt_tokens"]
             response_tokens = traj["response_tokens"]
             # test if trajectory is empty
@@ -573,13 +601,20 @@ class AgentPPOTrainer(RayPPOTrainer):
             all_response_tokens_list.append(response_tokens)
             all_masks_list.append(traj["response_masks"])
             traj_scores.append(traj["trajectory_reward"])
+            # Get inference log probs if available
+            traj_inf_log_probs = traj.get("inf_log_probs", None)
+            all_inf_log_probs_list.append(traj_inf_log_probs)
+            
             chat_completions.append(traj["chat_completions"])
             traj_metrics.append(traj["metrics"])
+            termination_reason_rato[traj["termination_reason"]] += 1
+
             down_infos.append(
                 {
                     "prompt_tokens": str(prompt_tokens.tolist()),
                     "response_tokens": str(response_tokens.tolist()),
                     "response_masks": str(traj["response_masks"].tolist()),
+                    "traj_inf_log_probs": str(traj_inf_log_probs.tolist()) if traj_inf_log_probs is not None else "",
                     "chat_completions": traj["chat_completions"],
                     "trajectory_reward": str(traj["trajectory_reward"]),
                     "metrics": str(traj["metrics"]),
@@ -593,17 +628,23 @@ class AgentPPOTrainer(RayPPOTrainer):
         traj_metrics = {k: [d[k] for d in traj_metrics] for k in traj_metrics[0]}
         # Aggregate metrics (mean, min, max)
         for k, v_list in traj_metrics.items():
-            v_list = [v for v in v_list if v is not None and v >= 0]
-            if not v_list:
-                continue
-            v_list = np.array(v_list)
-            metrics.update(
-                {
-                    f"traj/{k}_mean": v_list.mean(),
-                    f"traj/{k}_min": v_list.min(),
-                    f"traj/{k}_max": v_list.max(),
-                }
-            )
+            try:
+                v_list = [v for v in v_list if v is not None and v >= 0]
+                if not v_list:
+                    continue
+                v_list = np.array(v_list)
+                metrics.update(
+                    {
+                        f"traj/{k}_mean": v_list.mean(),
+                        f"traj/{k}_min": v_list.min(),
+                        f"traj/{k}_max": v_list.max(),
+                    }
+                )
+            except Exception as e:
+                print(f"[TrajectoryMetric] cal traj metric error, info is k={k} and v={v_list}")
+                
+        for k, v in termination_reason_rato.items():
+            metrics[k] = v
 
         # Save chat completions to a file
         save_dir = os.path.join(self.config.trainer.default_local_dir, "chat_completions")
@@ -635,7 +676,22 @@ class AgentPPOTrainer(RayPPOTrainer):
 
         max_response_length = self.config.data.max_response_length
         response_batch = pad_sequence_to_length(response_batch, max_response_length, self.tokenizer.pad_token_id, left_pad=False)
-
+        
+        # Process inference log probs: pad to match response_batch shape
+        inf_log_probs_batch = None
+        if all_inf_log_probs_list and any(x is not None for x in all_inf_log_probs_list):
+            padded_inf_log_probs = []
+            for i, inf_log_probs in enumerate(all_inf_log_probs_list):
+                response_len = all_response_tokens_list[i].shape[0]
+                if inf_log_probs is not None and inf_log_probs.shape[0] == response_len:
+                    # Pad to max_response_length with 0.0
+                    padded = torch.nn.functional.pad(inf_log_probs, (0, max_response_length - response_len), value=0.0)
+                    padded_inf_log_probs.append(padded)
+                else:
+                    # Use zeros if not available or length mismatch
+                    padded_inf_log_probs.append(torch.zeros(max_response_length, dtype=torch.float32))
+            inf_log_probs_batch = torch.stack(padded_inf_log_probs, dim=0)
+            
         traj_mask = torch.nn.utils.rnn.pad_sequence(all_masks_list, batch_first=True, padding_value=0)
         traj_mask = pad_sequence_to_length(traj_mask, max_response_length, 0, left_pad=False)
 
@@ -656,6 +712,8 @@ class AgentPPOTrainer(RayPPOTrainer):
             last_valid_idx = valid_response_length_sequences[i] - 1
             if last_valid_idx >= 0 and last_valid_idx < score_batch.shape[1]:
                 score_batch[i, last_valid_idx] = traj_score
+                
+        sequence_lengths = valid_response_length_sequences.tolist()
 
         tensor_batch = {
             "input_ids": trajectory_batch,
@@ -666,10 +724,20 @@ class AgentPPOTrainer(RayPPOTrainer):
             "token_level_scores": score_batch,
             "traj_mask": traj_mask,
         }
+        
+        # Add inference log probs if available
+        if inf_log_probs_batch is not None:
+            tensor_batch["inf_log_probs"] = inf_log_probs_batch
+            
+        # Non-tensor data for trajectory linking
+        non_tensor_batch = {
+            "trajectory_uuids": np.array(trajectory_uuids, dtype=object),
+            "sequence_lengths": np.array(sequence_lengths, dtype=np.int32),
+        }
 
         self.visualize_trajectory(DataProto.from_dict(tensors=tensor_batch))
 
-        return DataProto.from_dict(tensors=tensor_batch), metrics
+        return DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch), metrics
 
     def visualize_trajectory(self, tensor_batch, sample_idx=0, max_samples=1, mask_key="traj_mask"):
         """
@@ -784,6 +852,7 @@ class AgentPPOTrainer(RayPPOTrainer):
 
     def _transform_agent_steps(self, steps: list[dict], uids: np.ndarray):
         from verl.utils.torch_functional import pad_sequence_to_length
+        
 
         all_prompts_list = []
         all_responses_list = []
