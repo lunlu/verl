@@ -140,7 +140,7 @@ class PodManager:
             "kubeconfig_path": self.kubeconfig_path,
             "working_dir": self.working_dir
         }
-        pod_path = os.getenv("POD_PATH", "")
+        pod_path = env_args.get("POD_PATH", "")
         
         # Environment variables for the container
         environment = {
