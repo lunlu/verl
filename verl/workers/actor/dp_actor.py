@@ -20,6 +20,7 @@ Single Process Actor
 import logging
 import os
 
+import numpy as np
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -605,6 +606,8 @@ class DataParallelPPOActor(BasePPOActor):
         
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        if "trajectory_uuids" in data.non_tensor_batch.keys():
+            non_tensor_select_keys.append("trajectory_uuids")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
@@ -619,6 +622,11 @@ class DataParallelPPOActor(BasePPOActor):
         old_logs_prob_list = []
         advantage_list = []
         response_mask_list = []
+        inf_log_probs_list = []
+        input_ids_list = []
+        response_ids_list = []
+        trajectory_uuids_list = []
+        entropy_list = []
         
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
@@ -639,11 +647,19 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                    input_ids = model_inputs["input_ids"]
+                    input_ids_list.append(input_ids.to("cpu").detach())
+                    response_ids = model_inputs["responses"]
+                    response_ids_list.append(response_ids.to("cpu").detach())
                     if "traj_mask" in model_inputs:
                         response_mask = model_inputs["traj_mask"]
                         print("[TrainingLogs] Using mask schema from traj mask!")
                     else:
                         response_mask = model_inputs["response_mask"]
+                    if "trajectory_uuids" in model_inputs:
+                        trajectory_uuids = model_inputs["trajectory_uuids"].tolist()
+                        trajectory_uuids_list.extend(trajectory_uuids)
+                        
                     old_log_prob = model_inputs["old_log_probs"]
                     rollout_log_probs = model_inputs["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
                     advantages = model_inputs["advantages"]
@@ -664,7 +680,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if 'inf_log_probs' in model_inputs:
                         inf_log_probs = model_inputs['inf_log_probs']
-
+                        inf_log_probs_list.append(inf_log_probs.to("cpu").detach())
                         # Apply IcePop (token-level masking)
                         if USE_ICEPOP:
                             icepop_mask, icepop_stats = self._compute_icepop_mask(
@@ -701,7 +717,7 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
-
+                    entropy_list.append(entropy.to("cpu").detach())
                     if on_policy:
                         old_log_prob = log_prob.detach()
                     else:
@@ -744,10 +760,10 @@ class DataParallelPPOActor(BasePPOActor):
                         tis_token_ratio=tis_token_ratio
                     )
                     
-                    logs_prob_list.append(log_prob)
-                    old_logs_prob_list.append(old_log_prob)
-                    advantage_list.append(advantages)
-                    response_mask_list.append(response_mask)
+                    logs_prob_list.append(log_prob.to("cpu").detach())
+                    old_logs_prob_list.append(old_log_prob.to("cpu").detach())
+                    advantage_list.append(advantages.to("cpu").detach())
+                    response_mask_list.append(response_mask.to("cpu").detach())
                     
                     if entropy_coeff == 0:
                         loss_agg_mode_entropy = 'token-mean'
@@ -810,13 +826,27 @@ class DataParallelPPOActor(BasePPOActor):
         old_logs_prob_list = torch.concat(old_logs_prob_list).detach().to('cpu').tolist()
         advantage_list = torch.concat(advantage_list).detach().to('cpu').tolist()
         response_mask_list = torch.concat(response_mask_list).detach().to('cpu').tolist()
+        inf_log_probs_list = torch.concat(inf_log_probs_list).detach().to('cpu').tolist()
+        input_ids_list = torch.concat(input_ids_list).detach().to('cpu').tolist()
+        response_ids_list = torch.concat(response_ids_list).detach().to('cpu').tolist()
+        entropy_list = torch.concat(entropy_list).detach().to('cpu').tolist()
         metrics["logs_prob_list"] = logs_prob_list
         metrics["old_logs_prob_list"] = old_logs_prob_list
         metrics["advantage_list"] = advantage_list
         metrics["response_mask_list"] = response_mask_list
-#         print(f"[TrainingLogs ] logs_prob_list is {logs_prob_list}")
-#         print(f"[TrainingLogs ] old_logs_prob_list is {old_logs_prob_list}")
-#         print(f"[TrainingLogs ] advantage_list is {advantage_list}")
-#         print(f"[TrainingLogs ] response_mask_list is {response_mask_list}")
+        metrics["inf_log_probs_list"] = inf_log_probs_list
+        metrics["input_ids_list"] = input_ids_list
+        metrics["response_ids_list"] = response_ids_list
+        metrics["trajectory_uuids_list"] = trajectory_uuids_list
+        metrics["entropy_list"] = entropy_list
+        print(f"[TrainingLogs ] logs_prob_list is {np.shape(logs_prob_list)}")
+        print(f"[TrainingLogs ] old_logs_prob_list is {np.shape(old_logs_prob_list)}")
+        print(f"[TrainingLogs ] advantage_list is {np.shape(advantage_list)}")
+        print(f"[TrainingLogs ] response_mask_list is {np.shape(response_mask_list)}")
+        print(f"[TrainingLogs ] inf_log_probs_list is {np.shape(inf_log_probs_list)}")
+        print(f"[TrainingLogs ] input_ids_list is {np.shape(input_ids_list)}")
+        print(f"[TrainingLogs ] response_ids_list is {np.shape(response_ids_list)}")
+        print(f"[TrainingLogs ] trajectory_uuids_list is {np.shape(trajectory_uuids_list)}")
+        print(f"[TrainingLogs ] entropy_list is {np.shape(entropy_list)}")
         self.actor_optimizer.zero_grad()
         return metrics

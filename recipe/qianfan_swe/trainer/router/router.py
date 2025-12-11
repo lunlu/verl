@@ -228,7 +228,7 @@ class Router:
                 cur_address = self._application_id_to_address[application_id]
                 cur_usage = self._usage[cur_address]
                 # Load balance if there is skew
-                if (min_usage == 0 or cur_usage - min_usage >= 4) and cur_usage > 0:
+                if (min_usage == 0 or cur_usage - min_usage >= 50) and cur_usage > 0:
                     self._application_id_to_address[application_id] = min_address
                     self._usage[min_address] += 1
                 else:
@@ -318,16 +318,22 @@ class Router:
         logger.debug("Sending total requests: %s", self.counter)
         completions_list = await asyncio.gather(*tasks)
         await self.release_address(address, application_id)  # Release the address when done
-
+        
+        end_time = time.time()
+        print(f"[TrainingLogsRouter] current idx is {idx}, current application id is {application_id}, request address is {address}, model is {self.model_name}, gather cost time {end_time - start_time}")
+        
         for batch_index, completions in enumerate(completions_list):
             comps = []
             for choice in completions.get("choices", []):
                 token_ids = choice.get("logprobs", {}).get("tokens", [])
-                token_ids = [int(t.split(":")[1]) for t in token_ids]
+                if token_ids:
+                    token_ids = [int(t.split(":")[1]) for t in token_ids]
+                else:
+                    token_ids = self.tokenizer.encode(choice["text"] + self.tokenizer.eos_token)
                 comps.append(token_ids)
             batch_response_ids[batch_index] = comps
-        end_time = time.time()
-        print(f"[TrainingLogsRouter] current idx is {idx}, current application id is {application_id}, request address is {address}, model is {self.model_name}, kwargs is {kwargs}, cost time {end_time - start_time}")
+        end_time1 = time.time()
+        print(f"[TrainingLogsRouter] current idx is {idx}, current application id is {application_id}, request address is {address}, model is {self.model_name}, kwargs is {kwargs}, cost time {end_time1 - start_time}, parser cost time {end_time1 - end_time}")
 
 #         return await self.postprocess_batch(batch, batch_response_ids, kwargs["n"])
         # Extract inference log probs for IcePop

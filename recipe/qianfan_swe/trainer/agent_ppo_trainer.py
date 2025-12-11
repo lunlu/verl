@@ -160,7 +160,7 @@ class AgentPPOTrainer(RayPPOTrainer):
         images = [None] * len(env_args)
         pod_managers = [None] * len(env_args)
         
-        with ThreadPoolExecutor(max_workers=16) as executor:
+        with ThreadPoolExecutor(max_workers=64) as executor:
             agent_futures = [executor.submit(_create_agent, i, env_args, self.config) for i in range(len(env_args))]
             for future in as_completed(agent_futures):
                 idx, pod_name, image, agent, pod_manager = future.result()
@@ -195,7 +195,7 @@ class AgentPPOTrainer(RayPPOTrainer):
         print(f"Time taken to validate agent: {time.time() - start_time}")
         # we start from step 1
         self.global_steps += 1
-
+        print(f"[TrainingLogs] current config is {self.config}")
         for epoch in range(self.config.trainer.total_epochs):
             pprint(f"epoch {epoch}, step {self.global_steps} started")
             for batch_dict in self.train_dataloader:
@@ -253,10 +253,10 @@ class AgentPPOTrainer(RayPPOTrainer):
                             uid_rewards = reward_tensor[uid_mask].sum(-1)  # Sum rewards for each sequence
 
                             # Check if all rewards are <= 0 or all are 1 >= for this uid
-                            if (uid_rewards <= 0).all():
+                            if (uid_rewards <= self.config.agent.get("low_thre", 0)).all():
                                 valid_mask[uid_mask] = False
                                 solve_none += 1
-                            elif (uid_rewards >= 1).all():
+                            elif (uid_rewards >= self.config.agent.get("high_thre", 1)).all():
                                 valid_mask[uid_mask] = False
                                 solve_all += 1
 
@@ -276,6 +276,7 @@ class AgentPPOTrainer(RayPPOTrainer):
 
                             # If no valid samples remain, skip this batch and get a new one
                             if not valid_mask.any():
+                                print(f"[TrainingLogs] current step {self.global_steps} valid_mask=None, skip!")
                                 continue
 
                             # Filter batch to keep only valid samples
@@ -286,6 +287,7 @@ class AgentPPOTrainer(RayPPOTrainer):
                             max_batch_size = (batch.batch["input_ids"].shape[0] // num_trainer_replicas) * num_trainer_replicas
                             if not max_batch_size:
                                 # give up, you got everything either all wrong or right.
+                                print(f"[TrainingLogs] current step {self.global_steps} max_batch_size=None, skip!")
                                 continue
 
                             size_mask = torch.zeros(batch.batch["input_ids"].shape[0], dtype=torch.bool)
@@ -356,19 +358,39 @@ class AgentPPOTrainer(RayPPOTrainer):
                         old_logs_prob_list = None
                         advantage_list = None
                         response_mask_list = None
-                        metrics_ = actor_output.meta_info["metrics"]
+                        trajectory_uuids_list = None
+                        entropy_list = None
+#                         metrics_ = actor_output.meta_info["metrics"]
+                        metrics_ = actor_output.batch
+                        non_tensor_info = actor_output.non_tensor_batch
                         if "logs_prob_list" in metrics_:
-                            logs_prob_list = metrics_["logs_prob_list"]
+                            logs_prob_list = metrics_["logs_prob_list"].tolist()
                             del metrics_["logs_prob_list"]
                         if "old_logs_prob_list" in metrics_:
-                            old_logs_prob_list = metrics_["old_logs_prob_list"]
+                            old_logs_prob_list = metrics_["old_logs_prob_list"].tolist()
                             del metrics_["old_logs_prob_list"]
                         if "advantage_list" in metrics_:
-                            advantage_list = metrics_["advantage_list"]
+                            advantage_list = metrics_["advantage_list"].tolist()
                             del metrics_["advantage_list"]
                         if "response_mask_list" in metrics_:
-                            response_mask_list = metrics_["response_mask_list"]
+                            response_mask_list = metrics_["response_mask_list"].tolist()
                             del metrics_["response_mask_list"]
+                        if "inf_log_probs_list" in metrics_:
+                            inf_log_probs_list = metrics_["inf_log_probs_list"].tolist()
+                            del metrics_["inf_log_probs_list"]
+                        if "input_ids_list" in metrics_:
+                            input_ids_list = metrics_["input_ids_list"].tolist()
+                            del metrics_["input_ids_list"]
+                        if "response_ids_list" in metrics_:
+                            response_ids_list = metrics_["response_ids_list"].tolist()
+                            del metrics_["response_ids_list"]
+                        if "entropy_list" in metrics_:
+                            entropy_list = metrics_["entropy_list"].tolist()
+                            del metrics_["entropy_list"]
+                        if "trajectory_uuids_list" in non_tensor_info:
+                            trajectory_uuids_list = non_tensor_info["trajectory_uuids_list"].tolist()
+                            del non_tensor_info["trajectory_uuids_list"]
+                        
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
@@ -387,12 +409,22 @@ class AgentPPOTrainer(RayPPOTrainer):
                             advantages = batch.batch["advantages"].cpu().tolist()
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
                             response_mask = batch.batch["response_mask"].cpu().tolist()
+#                             inf_log_probs_list = batch.batch["inf_log_probs_list"].cpu().tolist()
                             reward_extra_infos_dict = {}
                             #仅当actor.use_dynamic_bsz=False的情况下logs_prob_list/old_logs_prob_list/advantage_list/response_mask_list可以与inputs/outputs/scores等对齐顺序，否则不对齐
                             self._dump_generations(
                                 inputs=inputs,
                                 outputs=outputs,
                                 scores=scores,
+                                logs_prob_list=logs_prob_list,
+                                old_logs_prob_list=old_logs_prob_list,
+                                inf_log_probs_list=inf_log_probs_list,
+                                advantage_list=advantage_list,
+                                response_mask_list=response_mask_list,
+                                input_ids_list=input_ids_list,
+                                response_ids_list=response_ids_list,
+                                trajectory_uuids_list=trajectory_uuids_list,
+                                entropy_list=entropy_list,
                                 gts=None,
                                 reward_extra_infos_dict=reward_extra_infos_dict,
                                 dump_path=rollout_data_dir
@@ -587,6 +619,8 @@ class AgentPPOTrainer(RayPPOTrainer):
         traj_metrics = []
         metrics = {}
         termination_reason_rato = defaultdict(int)
+        reward_info_rato = defaultdict(int)
+        response_token_types = []
         
         down_infos = []
 
@@ -608,22 +642,31 @@ class AgentPPOTrainer(RayPPOTrainer):
             chat_completions.append(traj["chat_completions"])
             traj_metrics.append(traj["metrics"])
             termination_reason_rato[traj["termination_reason"]] += 1
+            reward_info_rato[traj["metrics"]["reward_info"]] += 1
 
             down_infos.append(
                 {
                     "prompt_tokens": str(prompt_tokens.tolist()),
+                    "trajectory_uuid": trajectory_uuid,
                     "response_tokens": str(response_tokens.tolist()),
                     "response_masks": str(traj["response_masks"].tolist()),
                     "traj_inf_log_probs": str(traj_inf_log_probs.tolist()) if traj_inf_log_probs is not None else "",
+                    "response_token_types": json.dumps(traj["response_token_types"], ensure_ascii=False),
+                    "formatted_prompts": json.dumps(traj["formatted_prompts"], ensure_ascii=False),
                     "chat_completions": traj["chat_completions"],
                     "trajectory_reward": str(traj["trajectory_reward"]),
-                    "metrics": str(traj["metrics"]),
+                    "metrics": json.dumps(traj["metrics"], ensure_ascii=False),
                     "docker": traj["docker"],
                     "termination_reason": traj["termination_reason"],
                     "mask": traj["masked_out"]
                 }
             )
-
+        #增加response_length
+        try:
+            response_length_assistant_mean = [x.detach().sum().item() for i, x in enumerate(all_masks_list) if not down_infos[i]["mask"]]
+            metrics["response_length/response_length_assistant_mean"] = sum(response_length_assistant_mean) / len(response_length_assistant_mean)
+        except Exception as e:
+            print(f"[TrainingMetrics] sum response length error, e: {e}")
         # Flatten traj_metrics into a dict of lists
         traj_metrics = {k: [d[k] for d in traj_metrics] for k in traj_metrics[0]}
         # Aggregate metrics (mean, min, max)
@@ -641,9 +684,11 @@ class AgentPPOTrainer(RayPPOTrainer):
                     }
                 )
             except Exception as e:
-                print(f"[TrajectoryMetric] cal traj metric error, info is k={k} and v={v_list}")
+                print(f"[TrajectoryMetric] cal traj metric error, info is k={k}")
                 
         for k, v in termination_reason_rato.items():
+            metrics[k] = v
+        for k, v in reward_info_rato.items():
             metrics[k] = v
 
         # Save chat completions to a file

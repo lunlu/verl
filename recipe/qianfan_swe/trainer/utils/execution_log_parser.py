@@ -57,6 +57,136 @@ specific parsers as needed for different software engineering evaluation tasks.
 
 import re
 
+import requests
+import json
+import re
+from typing import Dict, Any, Optional, List
+from datetime import datetime
+
+
+def extract_warnings(output: str) -> List[str]:
+    """从输出中提取警告信息"""
+    warnings = []
+    
+    # 常见的警告模式
+    warning_patterns = [
+        r"WARNING?:?\s*(.+)",
+        r"WARN:?\s*(.+)",
+        r"⚠️\s*(.+)",
+        r"warning\s*:\s*(.+)",
+        r"\[WARN\]\s*(.+)",
+        r"eslint.*warning.*:\s*(.+)",
+        r"tslint.*warning.*:\s*(.+)"
+    ]
+    
+    for pattern in warning_patterns:
+        matches = re.finditer(pattern, output, re.IGNORECASE | re.MULTILINE)
+        for match in matches:
+            warning_text = match.group(1).strip() if match.groups() else match.group(0).strip()
+            if warning_text and warning_text not in warnings:
+                warnings.append(warning_text)
+    
+    return warnings[:10]  # 限制数量
+
+
+def extract_errors(output: str) -> List[str]:
+    """从输出中提取错误信息"""
+    errors = []
+    
+    # 常见的错误模式
+    error_patterns = [
+        r"ERROR:?\s*(.+)",
+        r"FATAL:?\s*(.+)",
+        r"❌\s*(.+)",
+        r"error\s*:\s*(.+)",
+        r"\[ERROR\]\s*(.+)",
+        r"Build failed:?\s*(.+)",
+        r"Compilation failed:?\s*(.+)",
+        r"eslint.*error.*:\s*(.+)",
+        r"tslint.*error.*:\s*(.+)",
+        r"TypeError:?\s*(.+)",
+        r"SyntaxError:?\s*(.+)",
+        r"ReferenceError:?\s*(.+)"
+    ]
+    
+    for pattern in error_patterns:
+        matches = re.finditer(pattern, output, re.IGNORECASE | re.MULTILINE)
+        for match in matches:
+            error_text = match.group(1).strip() if match.groups() else match.group(0).strip()
+            if error_text and error_text not in errors:
+                errors.append(error_text)
+    
+    return errors[:10]  # 限制数量
+
+def remote_build_code(results) -> Dict[str, Any]:
+    """执行远程代码构建和检查"""
+    # 检查参数
+    if results:
+        # 分析所有命令的执行结果
+        all_success = True
+        all_outputs = []
+        all_errors = []
+        all_warnings = []
+        total_duration = 0
+
+        for result in results:
+            command = result.get("command", "")
+            exit_code = result.get("exit_code", 0)
+            success = result.get("success", False)
+            output = result.get("output", "")
+            duration = result.get("duration_seconds", 0)
+
+            total_duration += duration
+            all_success = all_success and success
+            all_outputs.append(f"Command: {command}\nOutput: {output}")
+
+            if not success:
+                all_errors.append(f"Command '{command}' failed: {output}")
+            else:
+                # 从成功命令的输出中提取警告
+                cmd_warnings = extract_warnings(output)
+                all_warnings.extend(cmd_warnings)
+        # 合并所有输出
+        combined_output = "\n\n".join(all_outputs)
+        stdout = combined_output
+        stderr = "\n".join(all_errors) if all_errors else ""
+
+        # 使用整体成功状态
+        success = all_success
+        exit_code = 0 if all_success else 1
+
+    else:
+        # 旧格式兼容
+        exit_code = response_data.get("exit_code", 0)
+
+        if "result" in response_data:
+            # 使用result字段作为输出
+            stdout = response_data.get("result", "")
+            stderr = response_data.get("error", "")
+        else:
+            # 标准格式
+            stdout = response_data.get("stdout", "")
+            stderr = response_data.get("stderr", "")
+
+        combined_output = f"{stdout}\n{stderr}"
+
+        # 解析警告和错误
+        all_warnings = extract_warnings(combined_output)
+        all_errors = extract_errors(combined_output)
+
+        success = exit_code == 0 and len(all_errors) == 0
+
+    return {
+        'success': success,
+        'duration': duration,
+        'exit_code': exit_code,
+        'stdout': stdout,
+        'stderr': stderr,
+        'warnings': all_warnings,
+        'errors': all_errors,
+        'timestamp': datetime.now().isoformat()
+    }
+
 def parse_log_pytest(log: str | None) -> dict[str, str]:
     """
     Parser for test logs generated with Sympy framework

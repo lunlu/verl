@@ -256,6 +256,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self._is_offload_grad = False
         self._is_offload_optimizer = False
 
+        if self.config.rollout.name == "vllm":
+            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+            os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
+
         # normalize config
         if self._is_actor and self._is_rollout:
             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n

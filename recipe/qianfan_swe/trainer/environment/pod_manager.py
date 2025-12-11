@@ -66,9 +66,16 @@ R2EGYM_COMMAND_FILES = [
 ]
 
 MD_COMMAND_FILES = [
-    os.path.join(R2EGYM_PATH, "tools/r2e_tools_md/str_replace_editor.py"),
-    os.path.join(R2EGYM_PATH, "tools/r2e_tools_md/execute_bash.py"),
-    os.path.join(R2EGYM_PATH, "tools/r2e_tools_md/finish.py")
+    os.path.join(R2EGYM_PATH, "tools/miaoda/api_desc.py"),
+    os.path.join(R2EGYM_PATH, "tools/miaoda/api_rag.py"),
+    os.path.join(R2EGYM_PATH, "tools/miaoda/bash_func.py"),
+    os.path.join(R2EGYM_PATH, "tools/miaoda/file_editor.py"),
+    os.path.join(R2EGYM_PATH, "tools/miaoda/finish.py"),
+    os.path.join(R2EGYM_PATH, "tools/miaoda/image_search.py"),
+    os.path.join(R2EGYM_PATH, "tools/miaoda/supabase_init.py"),
+    os.path.join(R2EGYM_PATH, "tools/miaoda/supabase_migration.py"),
+    os.path.join(R2EGYM_PATH, "tools/miaoda/supabase_sql_execution.py"),
+    os.path.join(R2EGYM_PATH, "tools/miaoda/think.py")
 ]
 
 
@@ -140,8 +147,10 @@ class PodManager:
             "kubeconfig_path": self.kubeconfig_path,
             "working_dir": self.working_dir
         }
-        pod_path = env_args.get("POD_PATH", "")
         
+        pod_path = env_args.get("POD_PATH", "")
+        http_proxy = os.getenv("pod_http_proxy", "")
+        https_proxy = os.getenv("pod_https_proxy", "")
         # Environment variables for the container
         environment = {
             "PYTHONPATH": "/testbed",
@@ -152,13 +161,23 @@ class PodManager:
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
             # Proxy settings
-            "http_proxy": "http://agent.baidu.com:8891",
-            "https_proxy": "http://agent.baidu.com:8891",
             "PIP_INDEX_URL": "http://pip.baidu.com/pypi/simple",
             "PIP_TRUSTED_HOST": "pip.baidu.com"
         }
+        
         if pod_path:
             environment["PATH"] = pod_path
+        if http_proxy:
+            environment["http_proxy"] = http_proxy
+        if https_proxy:
+            environment["https_proxy"] = https_proxy
+            
+        other_kwargs = {}
+        node_selector = os.getenv("node_selector", "")
+        if isinstance(node_selector, str) and node_selector:
+            node_selector = eval(node_selector)
+        if node_selector:
+            other_kwargs["node_selector"] = node_selector
         
         # Try to start pod up to max_retries
         for attempt in range(max_retries):
@@ -168,8 +187,7 @@ class PodManager:
                 self.kodo_runner.start_container(
                     image,
                     name=pod_name,
-                    environment=environment,
-                    node_selector={"nvme": "ok"}
+                    environment=environment
                 )
                 
                 # Store pod info
@@ -428,7 +446,7 @@ class PodManager:
             self.execute_command(pod_name, "ln -s /opt/miniconda3/envs/testbed /root/.venv")
             
             #正常使用self.config.agent.chardet_path
-            chardet_path = os.os.getenv("CHARTDET_PATH", "")
+            chardet_path = os.getenv("CHARTDET_PATH", "")
             #正常使用self.config.agent.dest_path
             if chardet_path:
                 dest_path= "/usr/local/bin/chardet-3.0.0-py2.py3-none-any.whl"
@@ -467,16 +485,29 @@ class PodManager:
                 self.execute_command(pod_name, f"mv /code-template/react-shadcn-lite-template /workspace/{app_id}")
                 
             #正常使用self.config.agent.chardet_path
-            chardet_path = os.os.getenv("CHARTDET_PATH", "")
+            chardet_path = os.getenv("CHARTDET_PATH", "")
             if chardet_path:
                 self.kodo_runner.copy_to_container(pod_name, chardet_path, "/mnt/chardet-3.0.0-py2.py3-none-any.whl")
                 self.execute_command(pod_name, "pip install /mnt/chardet-3.0.0-py2.py3-none-any.whl --break-system-packages")
             else:
                 self.execute_command(pod_name, "pip install chardet --break-system-packages")
             
+            tool_mapping = {
+                  "bash_func": "miaoda_bash_executor",
+                  "file_editor": "miaoda_file_editor",
+                  "think": "miaoda_think",
+                  "image_search": "miaoda_image_search",
+                  "api_rag": "miaoda_api_rag",
+                  "api_desc": "miaoda_api_desc",
+                  "supabase_init": "miaoda_supabase_init",
+                  "supabase_migration": "miaoda_supabase_migration",
+                  "supabase_sql_execution": "miaoda_supabase_sql",
+                  "finish": "miaoda_finish"
+              }
+            
             for command_path in MD_COMMAND_FILES:
                 #组合copy地址，去掉文件名称最后的.py部分
-                dest_dir = "/usr/local/bin/" + os.path.basename(command_path).rsplit(".", 1)[0]
+                dest_dir = "/usr/local/bin/" + tool_mapping[os.path.basename(command_path).rsplit(".", 1)[0]]
                 self.kodo_runner.copy_to_container(pod_name, command_path, dest_dir)
                 self.execute_command(pod_name, f"chmod +x {dest_dir}")
             

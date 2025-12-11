@@ -52,7 +52,8 @@ from torch.distributed.device_mesh import DeviceMesh
 from vllm import LLM, SamplingParams
 from vllm.config import CompilationConfig, CompilationLevel
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.sampling_metadata import SamplingMetadata
+#from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.worker.worker_base import WorkerWrapperBase
 
 from verl import DataProto
@@ -96,6 +97,7 @@ class vLLMRollout(BaseRollout):
         device_mesh: DeviceMesh,
     ):
         super().__init__(config, model_config, device_mesh)
+        print(f'vLLMRollout')
 
         if config.layered_summon:
             self.sleep_level = 1
@@ -432,6 +434,8 @@ class vLLMRollout(BaseRollout):
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
+        print(f'vLLMRollout update_weights')
+
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
             lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
@@ -478,6 +482,7 @@ class vLLMAsyncRollout(BaseRollout):
         device_mesh: DeviceMesh,
     ):
         super().__init__(config, model_config, device_mesh)
+        print(f'vLLMAsyncRollout')
 
         self.tokenizer = model_config.tokenizer
         self.inference_engine: WorkerWrapperBase = None
@@ -540,12 +545,13 @@ class vLLMAsyncRollout(BaseRollout):
             else int(ray.get_runtime_context().get_accelerator_ids()[device_name][0])
         )
         self.vllm_config = all_kwargs[0]["vllm_config"]
+        print(f'vLLMAsyncRollout init_worker {self.vllm_config} all_kwargs: {all_kwargs}')
         self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
         self.inference_engine.init_worker(all_kwargs)
 
     def _load_model(self, *args, **kwargs):
         self.inference_engine.load_model(*args, **kwargs)
-        _monkey_patch_compute_logits(self.inference_engine.worker.model_runner.model, len(self.tokenizer))
+        #_monkey_patch_compute_logits(self.inference_engine.worker.model_runner.model, len(self.tokenizer))
 
     async def _execute_method(self, method: str | bytes, *args, **kwargs):
         if method == "init_worker":
@@ -578,16 +584,28 @@ class vLLMAsyncRollout(BaseRollout):
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
         from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
-
+        print(f'vLLMAsyncRollout update_weights')
         model = self.inference_engine.worker.model_runner.model
         patch_vllm_moe_model_weight_loader(model)
         model.load_weights(weights)
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
-        """Batch generate sequences in sync mode."""
+        """
+        在同步模式下批量生成序列。
+
+        Args:
+            prompts: 输入提示词数据原型，包含需要生成序列的提示词信息
+
+        Returns:
+            DataProto: 生成的序列数据原型，包含模型生成的文本序列
+
+        Raises:
+            NotImplementedError: 该方法尚未实现，需要在子类中具体实现
+        """
         raise NotImplementedError
 
     # ==================== server mode public methods ====================
 
     def get_zeromq_address(self):
         return self.address
+

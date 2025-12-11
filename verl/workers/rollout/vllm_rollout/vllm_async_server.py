@@ -17,6 +17,9 @@ import os
 import pickle
 from typing import Any, Callable, Optional
 
+import uuid
+import json
+
 import numpy as np
 import ray
 import zmq
@@ -109,6 +112,7 @@ class ExternalRayDistributedExecutor(Executor):
         timeout: Optional[float] = None,
         args: tuple = (),
         kwargs: Optional[dict[str, Any]] = None,
+        **kwargs_extra: Any,
     ) -> list[Any]:
         # TODO(wuxibin): support ray compiled graph
         if isinstance(method, str):
@@ -158,6 +162,7 @@ class ExternalZeroMQDistributedExecutor(Executor):
         timeout: Optional[float] = None,
         args: tuple = (),
         kwargs: Optional[dict[str, Any]] = None,
+        **kwargs_extra: Any,
     ) -> list[Any]:
         if isinstance(method, str):
             sent_method = method
@@ -221,7 +226,7 @@ class AsyncvLLMServer(AsyncServerBase):
         config = config.rollout
 
         tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
-        max_num_batched_tokens = config.get("max_num_batched_tokens", 8192)
+        max_num_batched_tokens = config.get("max_num_batched_tokens", 32768)
         max_model_len = config.max_model_len if config.max_model_len else config.prompt_length + config.response_length
         self.max_model_len = int(max_model_len)
 
@@ -283,7 +288,7 @@ class AsyncvLLMServer(AsyncServerBase):
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
             seed=self.vllm_dp_rank, #config.get("seed", 0),
-            max_num_seqs=256,
+            max_num_seqs=1024,
             hf_overrides={"max_position_embeddings": max_model_len},
             **compilation_config,
             **engine_kwargs,
@@ -361,8 +366,10 @@ class AsyncvLLMServer(AsyncServerBase):
         request = CompletionRequest(**request_json)
         import time
         st = time.time()
+
         generator = await self.openai_serving_completion.create_completion(request, raw_request)
         et = time.time()
+
         print(f"[VllmAsyncServerLogs] current request cost time is {et - st}")
         if isinstance(generator, ErrorResponse):
             return JSONResponse(content=generator.model_dump(), status_code=generator.code)
@@ -370,11 +377,18 @@ class AsyncvLLMServer(AsyncServerBase):
             return StreamingResponse(content=generator, media_type="text/event-stream")
         else:
             assert isinstance(generator, CompletionResponse)
-#             if generator.choices and generator.choices[0].logprobs:
-#                 generator.choices[0].logprobs.token_logprobs = [] 
-#                 generator.choices[0].logprobs.top_logprobs = []
-#                 generator.choices[0].logprobs.text_offset = []
-            return JSONResponse(content=generator.model_dump())
+            #if generator.choices and generator.choices[0].logprobs:
+            #    generator.choices[0].logprobs.token_logprobs = [] 
+            #    generator.choices[0].logprobs.top_logprobs = []
+            #    generator.choices[0].logprobs.text_offset = []
+            #    generator.choices[0].logprobs.tokens = []
+            content = generator.model_dump()
+            content_keys = list(content.keys())
+            print(f"[VllmAsyncServerLogs] current request generator.choices[0].logprobs is {content_keys}, cost time is {et - st}")
+            model_response = JSONResponse(content=content)
+            et = time.time()
+            print(f"[VllmAsyncServerLogs] current JSONResponse finish cost time is {et - st}")
+            return model_response
 
     async def generate(
         self,
@@ -442,3 +456,4 @@ def _qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
         return prompt_ids[mask].tolist()
     else:
         return prompt_ids
+
