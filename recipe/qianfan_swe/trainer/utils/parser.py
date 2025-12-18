@@ -234,6 +234,7 @@ class DeepseekV31TerminusSWEChatTemplateParser(ChatTemplateParser):
             self.generation_prompt = self.assistant_token + "</think>"
         else:
             self.generation_prompt = self.assistant_token + "<think>"
+        print(f"[ChatParser] Using disable_thinking is {disable_thinking}")
 
     def _parse_tool_calls_from_content(self, content):
         """

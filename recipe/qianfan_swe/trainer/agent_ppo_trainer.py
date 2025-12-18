@@ -160,7 +160,7 @@ class AgentPPOTrainer(RayPPOTrainer):
         images = [None] * len(env_args)
         pod_managers = [None] * len(env_args)
         
-        with ThreadPoolExecutor(max_workers=64) as executor:
+        with ThreadPoolExecutor(max_workers=16) as executor:
             agent_futures = [executor.submit(_create_agent, i, env_args, self.config) for i in range(len(env_args))]
             for future in as_completed(agent_futures):
                 idx, pod_name, image, agent, pod_manager = future.result()
@@ -359,9 +359,14 @@ class AgentPPOTrainer(RayPPOTrainer):
                         advantage_list = None
                         response_mask_list = None
                         trajectory_uuids_list = None
+                        response_ids_list = None
+                        input_ids_list = None
+                        inf_log_probs_list = None
                         entropy_list = None
-#                         metrics_ = actor_output.meta_info["metrics"]
-                        metrics_ = actor_output.batch
+                        if actor_output.batch is not None:
+                            metrics_ = actor_output.batch
+                        else:
+                            metrics_ = actor_output.meta_info["metrics"]
                         non_tensor_info = actor_output.non_tensor_batch
                         if "logs_prob_list" in metrics_:
                             logs_prob_list = metrics_["logs_prob_list"].tolist()
@@ -387,7 +392,7 @@ class AgentPPOTrainer(RayPPOTrainer):
                         if "entropy_list" in metrics_:
                             entropy_list = metrics_["entropy_list"].tolist()
                             del metrics_["entropy_list"]
-                        if "trajectory_uuids_list" in non_tensor_info:
+                        if non_tensor_info and "trajectory_uuids_list" in non_tensor_info:
                             trajectory_uuids_list = non_tensor_info["trajectory_uuids_list"].tolist()
                             del non_tensor_info["trajectory_uuids_list"]
                         

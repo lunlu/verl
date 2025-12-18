@@ -491,6 +491,7 @@ class MegatronPPOActor(BasePPOActor):
             "advantages",
         ]
         if "traj_mask" in data.batch:
+            print("[TrainingUpdate] current using traj mask !!!")
             select_keys.append("traj_mask")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
@@ -515,6 +516,7 @@ class MegatronPPOActor(BasePPOActor):
         metrics = {}
         
         if "traj_mask" in data:
+            print("[TrainingUpdate] current using traj mask in ppo loss !!!")
             response_mask = data["traj_mask"].to(bool)
         else:
             response_mask = data["response_mask"].to(bool)

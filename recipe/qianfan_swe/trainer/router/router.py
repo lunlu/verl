@@ -36,6 +36,8 @@ the communication layer between agents and distributed model inference servers.
 import asyncio
 import logging
 from copy import deepcopy
+import time
+import uuid
 
 import aiohttp
 import numpy as np
@@ -157,11 +159,18 @@ async def poll_completions_openai(address: str, **completions_request) -> Comple
     for retry in range(max_retries):
         try:
             # Create a new session for each request to avoid blocking
+            # NOTE: Set proxy="" to bypass environment proxy settings (http_proxy/https_proxy)
+            # This is necessary when accessing internal network addresses while proxy is set globally
             async with aiohttp.ClientSession() as session:
-                async with session.post(base_url, json=completions_request, headers=headers, timeout=aiohttp.ClientTimeout(total=5400)) as response:
+                async with session.post(
+                    base_url,
+                    json=completions_request,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=5400)
+                ) as response:
                     if response.status != 200:
                         error_text = await response.text()
-                        print(f"API request params is : base_url={base_url}, headers={headers}")
+                        print(f"API request params is : base_url={base_url}, headers={headers}, Error, error_text is {error_text}")
                         raise Exception(f"API request failed with status {response.status}: {error_text}")
                     result = await response.json()
                     # Convert the raw JSON response to an OpenAI Completion object
@@ -228,7 +237,7 @@ class Router:
                 cur_address = self._application_id_to_address[application_id]
                 cur_usage = self._usage[cur_address]
                 # Load balance if there is skew
-                if (min_usage == 0 or cur_usage - min_usage >= 50) and cur_usage > 0:
+                if (min_usage == 0 or cur_usage - min_usage >= 4) and cur_usage > 0:
                     self._application_id_to_address[application_id] = min_address
                     self._usage[min_address] += 1
                 else:
@@ -295,11 +304,12 @@ class Router:
         # Bug: len(batch) is used later but batch might not have a __len__ method
         batch_size = len(batch.non_tensor_batch["formatted_prompts"])
         batch_response_ids: list[list[int]] = [[] for _ in range(batch_size)]
-
-        print(f"[TrainingLogsRouter] current idx is {idx}, current application id is {application_id}, request address is {address}, model is {self.model_name}, kwargs is {kwargs}")
-        
-        import time
+    
+        uid_str = str(uuid.uuid4())
+        kwargs["uid_str"] = uid_str
         start_time = time.time()
+        print(f"[TrainingLogsRouter] current idx is {idx}, current application id is {application_id}, request address is {address}, model is {self.model_name}, kwargs is {kwargs}, uid_str is {uid_str}, start_time is {start_time}")
+        
         for batch_index, formatted_prompt in enumerate(batch.non_tensor_batch["formatted_prompts"]):
             # For Completion API, we need to convert the conversation to a prompt string
             self.counter += 1
@@ -320,7 +330,7 @@ class Router:
         await self.release_address(address, application_id)  # Release the address when done
         
         end_time = time.time()
-        print(f"[TrainingLogsRouter] current idx is {idx}, current application id is {application_id}, request address is {address}, model is {self.model_name}, gather cost time {end_time - start_time}")
+        print(f"[TrainingLogsRouter] current idx is {idx}, current application id is {application_id}, request address is {address}, model is {self.model_name}, gather cost time {end_time - start_time}, uid_str is {uid_str}, end_time is {end_time}")
         
         for batch_index, completions in enumerate(completions_list):
             comps = []

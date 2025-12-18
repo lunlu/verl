@@ -288,7 +288,7 @@ class AsyncvLLMServer(AsyncServerBase):
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
             seed=self.vllm_dp_rank, #config.get("seed", 0),
-            max_num_seqs=1024,
+            max_num_seqs=256,
             hf_overrides={"max_position_embeddings": max_model_len},
             **compilation_config,
             **engine_kwargs,
@@ -363,12 +363,40 @@ class AsyncvLLMServer(AsyncServerBase):
         API reference: https://platform.openai.com/docs/api-reference/completions/create
         """
         request_json = await raw_request.json()
+        uid_str = request_json.get("uid_str", "none")
         request = CompletionRequest(**request_json)
         import time
         st = time.time()
+        print(f"[VllmAsyncServerLogs] current receive request uid_str is {uid_str}, start time is {st}")
+        # Get KV cache stats before request
+        cache_stats_before = None
+        try:
+            if hasattr(self.engine, 'engine_core') and hasattr(self.engine.engine_core, 'scheduler'):
+                scheduler = self.engine.engine_core.scheduler
+                if hasattr(scheduler, 'kv_cache_manager'):
+                    cache_stats_before = scheduler.kv_cache_manager.make_prefix_cache_stats()
+        except Exception as e:
+            print(f"[VllmAsyncServerLogs] Failed to get cache stats before request: {e}")
 
         generator = await self.openai_serving_completion.create_completion(request, raw_request)
         et = time.time()
+
+        # Get KV cache stats after request
+        cache_stats_after = None
+        try:
+            if hasattr(self.engine, 'engine_core') and hasattr(self.engine.engine_core, 'scheduler'):
+                scheduler = self.engine.engine_core.scheduler
+                if hasattr(scheduler, 'kv_cache_manager'):
+                    cache_stats_after = scheduler.kv_cache_manager.make_prefix_cache_stats()
+        except Exception as e:
+            print(f"Failed to get cache stats after request: {e}")
+
+        # Calculate cache hit rate
+        if cache_stats_after and cache_stats_after.queries > 0:
+            hit_rate = (cache_stats_after.hits / cache_stats_after.queries) * 100
+            print(f"[VllmAsyncServerLogs] KV Cache Stats - Requests: {cache_stats_after.requests}, "
+                  f"Queries: {cache_stats_after.queries}, Hits: {cache_stats_after.hits}, "
+                  f"Hit Rate: {hit_rate:.2f}%, Reset: {cache_stats_after.reset}")
 
         print(f"[VllmAsyncServerLogs] current request cost time is {et - st}")
         if isinstance(generator, ErrorResponse):
@@ -377,17 +405,21 @@ class AsyncvLLMServer(AsyncServerBase):
             return StreamingResponse(content=generator, media_type="text/event-stream")
         else:
             assert isinstance(generator, CompletionResponse)
-            #if generator.choices and generator.choices[0].logprobs:
-            #    generator.choices[0].logprobs.token_logprobs = [] 
-            #    generator.choices[0].logprobs.top_logprobs = []
-            #    generator.choices[0].logprobs.text_offset = []
-            #    generator.choices[0].logprobs.tokens = []
+            if generator.choices and generator.choices[0].logprobs:
+#                 generator.choices[0].logprobs.token_logprobs = [] 
+                generator.choices[0].logprobs.top_logprobs = []
+                generator.choices[0].logprobs.text_offset = []
+#                 generator.choices[0].logprobs.tokens = []
             content = generator.model_dump()
+            uids = str(uuid.uuid4())
+#             with open(f"/mnt/cfs_bj_mt/workspace/tianlun-2/grpo_train/verl_bce_v3_logp_push_v4_ds_tools_icepop_md_tools_thre_ds_testb/tmp/{uids}.txt", "w") as f:
+#                 f.write(json.dumps(content, ensure_ascii=False))
             content_keys = list(content.keys())
             print(f"[VllmAsyncServerLogs] current request generator.choices[0].logprobs is {content_keys}, cost time is {et - st}")
             model_response = JSONResponse(content=content)
             et = time.time()
             print(f"[VllmAsyncServerLogs] current JSONResponse finish cost time is {et - st}")
+            print(f"[VllmAsyncServerLogs] current finish request uid_str is {uid_str}, end time is {et}, cost time is {et - st}")
             return model_response
 
     async def generate(

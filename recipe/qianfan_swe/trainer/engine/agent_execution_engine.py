@@ -598,7 +598,7 @@ class AgentExecutionEngine:
         """
         for ind in range(self.retry_limit):
             try:
-                return await asyncio.wait_for(self.run_agent_trajectory_async(idx, application_id=application_id, seed=seed, mode=mode, **kwargs), timeout=7200)
+                return await asyncio.wait_for(self.run_agent_trajectory_async(idx, application_id=application_id, seed=seed, mode=mode, **kwargs), timeout=10800)
             except Exception as e:
                 stack_trace = traceback.format_exc()
                 print(f"[TrainingLogs] func run_agent_trajectory_with_retry, generate trajectory error, error msg is {e}, response params is idx: {idx}, application_id: {application_id}, mode: {mode}, kwargs: {kwargs}, corresponding traceback code is : {stack_trace}, retry is {ind}/{self.retry_limit}")
@@ -951,10 +951,10 @@ class AgentExecutionEngine:
                     function_score = json.loads(func)
                     scores.append(function_score["function_score"])
                 reward = sum(scores) / func_num
-#                 if reward < 0.8:
-#                     reward = 0
-#                 else:
-#                     reward = 1
+                #if reward < 1:
+                #    reward = 0
+                #else:
+                #    reward = 1
             print(f"[RewardLogs] miaoda reward calculation: final reward={reward}, ori reward is {output}")
             return reward, "success", mask, reward_process_info
             
