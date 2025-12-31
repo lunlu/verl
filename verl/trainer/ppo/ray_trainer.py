@@ -261,6 +261,21 @@ def compute_advantage(
                                                                         index=data.non_tensor_batch['uid'])
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == AdvantageEstimator.LOOP_EMPG:
+        # Ensure we have old_entropy data
+        if 'entropys' not in data.batch:
+            raise ValueError("LOOP_EMPG requires 'entropys' in batch data")
+        advantages, returns = core_algos.compute_loop_empg_outcome_advantage(
+            responses=data.batch['responses'],
+            token_level_rewards=data.batch['token_level_rewards'],
+            response_mask=data.batch['response_mask'],
+            index=data.non_tensor_batch['uid'],
+            old_entropy=data.batch['entropys'],
+            k=kwargs.get('empg_k', 1.0),
+            k_f=kwargs.get('empg_k_f', 1.0),
+            zeta=kwargs.get('empg_zeta', 0))
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -467,7 +482,10 @@ class RayPPOTrainer:
 
         lines = []
         for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
+            entry = {}
+            for k, v in base_data.items():
+                entry[k] = v[i]
+#             entry = {k: v[i] for k, v in base_data.items()}
             lines.append(json.dumps(entry, ensure_ascii=False))
 
         with open(filename, "w") as f:

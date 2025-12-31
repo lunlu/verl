@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 from recipe.qianfan_swe.trainer.utils.agent_utils import _create_agent
 
+
 @contextmanager
 def log_time(desc="耗时"):
     """
@@ -110,14 +111,14 @@ class AgentExecutionEngine:
         trajectory_timeout=None,
         gamma=0.2,
         api_retries=5,
-        retry_limit=10,
+        retry_limit=3,
         max_steps=5,
         max_response_length=8192,
         max_prompt_length=1024,
         config=None,
         rollout_engine_args=None,
         env_args=None,
-        max_workers=256,
+        max_workers=1024,
         enforce_max_prompt_length=False,  # If enabled, applies max_prompt check per step
         overlong_filter=False,  # Filter for overlong trajectories (i.e. TRUNCATION, MAX_STEPS, TIMEOUT)
         logger=None,
@@ -188,6 +189,7 @@ class AgentExecutionEngine:
             self.chat_parser = chat_parser
             
         self.inf_logprobs_cache = {}
+        self.formatted_prompts = {}
 
 
     async def get_model_response(self, messages, application_id, **kwargs):
@@ -251,7 +253,8 @@ class AgentExecutionEngine:
         Raises:
             Exception: If there's an error during generation or processing
         """
-        batch = self._convert_prompt_verl([messages], **kwargs)
+        batch, formatted_prompts = self._convert_prompt_verl([messages], **kwargs)
+        self.formatted_prompts[application_id] = formatted_prompts
 
         if "max_tokens" in kwargs:
             batch.meta_info["max_tokens"] = kwargs["max_tokens"]
@@ -324,6 +327,10 @@ class AgentExecutionEngine:
             # Start timing for the entire trajectory
             trajectory_start_time = time.time()
             inference_log_probs_list = []
+            extra_infos = self.extra_infos[idx]
+            sample_type = extra_infos.get("sample_type", "r2e")
+            app_id = extra_infos.get("other_info", {}).get("app_id", "none")
+            
             try:
                 results = await asyncio.wait_for(
                     agent.run_trajectory(
@@ -339,6 +346,8 @@ class AgentExecutionEngine:
                         convert_messages_to_tokens_and_masks=convert_messages_to_tokens_and_masks,
                         pod_name=pod_name,
                         executor=self.executor,
+                        sample_type=sample_type,
+                        app_id=app_id,
                         **kwargs
                     ),
                     timeout=(self.trajectory_timeout*2)
@@ -472,17 +481,22 @@ class AgentExecutionEngine:
                     padded_inf_log_probs[assistant_positions[i]] = vllm_inf_log_probs[i]
 
                 traj_inf_log_probs = padded_inf_log_probs
-
+            
+            model_response_len = sum(response_masks)
+            
+            reward_info = "none"
             masked_out = False
             if self.overlong_filter:
                 if termination_reason in ["TRUNCATION", "MAX_STEPS", "TIMEOUT", "PROMPT_TRUNCATION"]:
                     # Mask out the entire response for overlong trajectories if the reward is 0.
                     response_masks = [0] * len(response_masks)
                     masked_out = True
+                    reward_info = "skip"
                     print(f"[TrajectoryLogs] Trajectory masked out due to overlong filter. Reason: {termination_reason}")
 
             # Calculate reward using PodManager (only if not already set to 0 due to truncation/timeout)
-            reward_info = ""
+            
+            reward_process_info = {}
             if not masked_out:
                 reward = await loop.run_in_executor(self.executor,
                                                     self._calculate_reward_with_pod_manager, 
@@ -492,7 +506,13 @@ class AgentExecutionEngine:
                 )
                 if isinstance(reward, list) or isinstance(reward, tuple):
                     reward_info = reward[1]
+                    masked_out = reward[2]
+                    reward_process_info = reward[3]
                     reward = reward[0]
+                    
+                    if masked_out:
+                        response_masks = [0] * len(response_masks)
+                        print(f"[TrajectoryLogs] Trajectory masked out due to cal reward error. Reason: error pod_name={pod_name}")
             
             # Log termination information
             if termination_reason:
@@ -503,11 +523,17 @@ class AgentExecutionEngine:
                 print(f"[TrajectoryLogs] Trajectory completed with {termination_reason}. Reward: {reward} ({color_msg})")
                 if masked_out:
                     print(f"[TrajectoryLogs] Trajectory is masked out due to overlong filter.")
-
+            
+            steps = len(trajectory_result.steps)//2 if hasattr(trajectory_result, 'steps') else 1
+            
             token_result = {
                 "prompt_tokens": torch.tensor(prompt_tokens, dtype=torch.long),
                 "response_tokens": torch.tensor(response_tokens, dtype=torch.long),
                 "response_masks": torch.tensor(response_masks, dtype=torch.long),
+                "model_response_len": model_response_len,
+                "model_response_mean_len": model_response_len / steps,
+                "response_token_types": response_token_types,
+                "formatted_prompts": self.formatted_prompts[application_id],
                 "inf_log_probs": traj_inf_log_probs,
                 "trajectory_reward": reward,
                 "docker": self.images[idx],
@@ -517,13 +543,15 @@ class AgentExecutionEngine:
                 "masked_out": float(masked_out),
                 "metrics": {
                     # Total number of steps taken in the trajectory
-                    "steps": len(trajectory_result.steps)//2 if hasattr(trajectory_result, 'steps') else 0,
+                    "steps": steps,
                     # Total time spent in the trajectory
                     "total_time": total_time,
                     # Token length information
                     "prompt_token_len": prompt_token_len,
                     "response_token_len": response_token_len,
-                    "reward_info": reward_info
+                    "reward_info": reward_info,
+                    "pod_name": pod_name,
+                    "reward_process_info": json.dumps(reward_process_info, ensure_ascii=False)
                 },
             }
             return token_result
@@ -571,7 +599,7 @@ class AgentExecutionEngine:
         """
         for ind in range(self.retry_limit):
             try:
-                return await asyncio.wait_for(self.run_agent_trajectory_async(idx, application_id=application_id, seed=seed, mode=mode, **kwargs), timeout=5400)
+                return await asyncio.wait_for(self.run_agent_trajectory_async(idx, application_id=application_id, seed=seed, mode=mode, **kwargs), timeout=10800)
             except Exception as e:
                 stack_trace = traceback.format_exc()
                 print(f"[TrainingLogs] func run_agent_trajectory_with_retry, generate trajectory error, error msg is {e}, response params is idx: {idx}, application_id: {application_id}, mode: {mode}, kwargs: {kwargs}, corresponding traceback code is : {stack_trace}, retry is {ind}/{self.retry_limit}")
@@ -597,7 +625,7 @@ class AgentExecutionEngine:
         """
         try:
             old_pod_name = self.pod_names[idx] if idx < len(self.pod_names) else None
-            env_args = [self.extra_infos[idx]] if idx < len(self.extra_infos) else [{}]
+            env_args = self.extra_infos
             
             if not old_pod_name:
                 print(f"[PodManager] Warning: No pod name found for index {idx}, cannot reset")
@@ -631,7 +659,8 @@ class AgentExecutionEngine:
             print(f"[PodManager] Agent and pod reset completed for index {idx}: {old_pod_name} -> {new_pod_name}")
             
         except Exception as e:
-            print(f"[PodManager] Error resetting agent and pod for index {idx}: {e}")
+            stack_trace = traceback.format_exc()
+            print(f"[PodManager] Error resetting agent and pod for index {idx}: {e}, stack_trace is {stack_trace}")
             # Don't raise the exception as this would prevent retry attempts
             # The retry will continue with the existing pod and agent
 
@@ -767,7 +796,7 @@ class AgentExecutionEngine:
             # only use the original_batch's meta_info since tensor_batch is from batch_dict and non_tensor_batch is not neeeded
             data.meta_info = union_two_dict(data.meta_info, meta_info)
 
-        return data
+        return data, formatted_prompts
 
 
     def _calculate_reward_with_pod_manager(self, pod_manager, pod_name, ds):
@@ -807,9 +836,9 @@ class AgentExecutionEngine:
             if swebench_verified:
                 return self._calculate_reward_swebench_pod_manager(pod_manager, pod_name, ds, "/", timeout=300)
             elif miaoda_task:
-                return self._calculate_reward_miaoda_pod_manager(pod_manager, pod_name, ds, "/workspace", timeout=300)
+                return self._calculate_reward_miaoda_pod_manager(pod_manager, pod_name, ds, "/workspace", timeout=600)
             elif r2e_task:
-                return self._calculate_reward_r2e_pod_manager(pod_manager, pod_name, ds, "/root", timeout=300)
+                return self._calculate_reward_r2e_pod_manager(pod_manager, pod_name, ds, "/root", timeout=600)
             else:
                 print(f"[TrainingLogs] sample type only support `r2e/swebench/md`, but get {sample_type}, docker_image is {docker_image}")
                 
@@ -819,62 +848,99 @@ class AgentExecutionEngine:
 
     def _calculate_reward_swebench_pod_manager(self, pod_manager, pod_name, ds, alt_path, timeout):
         """Calculate reward for SWE-bench verified environments using PodManager"""
-        try:
-            # Import required modules
-            from swebench.harness.constants import (
-                KEY_INSTANCE_ID, FAIL_TO_PASS, PASS_TO_PASS
-            )
-            from swebench.harness.grading import get_eval_tests_report, get_resolution_status
-            from swebench.harness.log_parsers import MAP_REPO_TO_PARSER, get_eval_type
-            from swebench.harness.constants import ResolvedStatus
-            
-            from swebench.harness.test_spec.test_spec import make_test_spec, TestSpec
-            # Run tests using PodManager
-            output, exit_code = pod_manager.execute_command(pod_name, f"timeout {timeout} bash {alt_path}/run_tests.sh", timeout)
-            
-            test_spec = make_test_spec(ds)
-            # Get test spec from environment
-            if not test_spec:
-                print("[RewardLogs] Warning: No test_spec found, returning 0.0")
-                return 0.0
+        reward_process_info = {}
+        mask = True
+        output = None
+        max_retrys = 3
+        for index in range(1, max_retrys + 1):
+            try:
+                # Import required modules
+                from swebench.harness.constants import (
+                    KEY_INSTANCE_ID, FAIL_TO_PASS, PASS_TO_PASS
+                )
+                from swebench.harness.grading import get_eval_tests_report, get_resolution_status
+                from recipe.qianfan_swe.trainer.utils.swebench_parser import get_eval_type
+                from swebench.harness.constants import ResolvedStatus
+
+                from swebench.harness.test_spec.test_spec import make_test_spec, TestSpec
+                # Run tests using PodManager
+                output, exit_code = pod_manager.execute_command(pod_name, f"timeout {timeout} bash {alt_path}/run_tests.sh", timeout)
+                reward_process_info["output"] = output
                 
-            # Parse logs using swebench parser
-            eval_status_map, found = self._get_logs_eval_kodo(test_spec, output)
-            if not found:
-                return 0.0
-                
-            eval_ref = {
-                KEY_INSTANCE_ID: test_spec.instance_id,
-                FAIL_TO_PASS: test_spec.FAIL_TO_PASS,
-                PASS_TO_PASS: test_spec.PASS_TO_PASS,
-            }
-            
-            report = get_eval_tests_report(
-                eval_status_map, eval_ref, eval_type=get_eval_type(test_spec)
-            )
-            success = get_resolution_status(report) == ResolvedStatus.FULL.value
-            
-            print(f"[RewardLogs] SWE-bench reward calculation: success={success}")
-            return int(success)
-            
-        except Exception as e:
-            print(f"[RewardLogs] Error in _calculate_reward_swebench_pod_manager: {e}")
-            return 0.0
+                instance_id = ds.get("instance_id", None)
+                FAIL_TO_PASS_repo = json.loads(ds.get("FAIL_TO_PASS", None))
+                PASS_TO_PASS_repo = json.loads(ds.get("PASS_TO_PASS", None))
+                repo = ds.get("repo", None)
+                version = ds.get("version", None)
+                #注意空list
+#                 if (not instance_id) or (not FAIL_TO_PASS_repo) or (not PASS_TO_PASS_repo) or (not repo) or (not version):
+#                     raise Exception("[RewardLogs] No swebench instance_id or FAIL_TO_PASS or .......")
+
+                # Parse logs using swebench parser
+                eval_status_map, found = self._get_logs_eval_kodo(repo, version, output)
+                if not found:
+                    print(f"[RewardLogs] Warning: No found  eval, returning 0.0, pod_name={pod_name}")
+                    return 0.0, "nologs", mask, reward_process_info
+
+                eval_ref = {
+                    KEY_INSTANCE_ID: instance_id,
+                    FAIL_TO_PASS: FAIL_TO_PASS_repo,
+                    PASS_TO_PASS: PASS_TO_PASS_repo,
+                }
+
+                report = get_eval_tests_report(
+                    eval_status_map, eval_ref, eval_type=get_eval_type(repo)
+                )
+                success = get_resolution_status(report) == ResolvedStatus.FULL.value
+
+                print(f"[RewardLogs] SWE-bench reward calculation: success={success}, pod_name={pod_name}")
+                mask = False
+                return float(success), "success", mask, reward_process_info
+
+            except Exception as e:
+                stack_trace = traceback.format_exc()
+                print(f"[RewardLogs] Error in _calculate_reward_swebench_pod_manager: {e}, pod_name is {pod_name}, retry index is {index}, stack_trace={stack_trace}")
+                if index < max_retrys:
+                    time.sleep(min(index * 2 + 2, 30))
+                    continue
+                reward_process_info["error"] = {"mask": mask, "stack_trace": str(stack_trace), "recent_output": output}
+                return 0.0, "error", mask, reward_process_info
         
     def _calculate_reward_miaoda_pod_manager(self, pod_manager, pod_name, ds, alt_path, timeout):
         """Calculate reward for R2E environments using PodManager"""
+        from recipe.qianfan_swe.trainer.utils.execution_log_parser import remote_build_code
+        other_info = ds.get("other_info", {})
+        app_id = other_info.get("app_id", None)
+        prd = other_info.get("PRD", None)
+        function_list = other_info.get("function_list", None)
         output = None
+        reward = 0.0
+        mask = False
+        reward_process_info = {}
+        
         try:
+            print(f"[RewardLogs] current pod name is {pod_name}, start lint eval!")
+            # calculate reward based for r2e-edit dockers
+            output, error_code = pod_manager.execute_command(pod_name, f"timeout {timeout} bash /workspace/run_lint_evaluation.sh /workspace/{app_id}")
+            print(f"[DockerLogs] reward cal result is {output}")
+            output_json = json.loads(output)
+            reward_output = remote_build_code(output_json["results"])
+            reward = float(reward_output["success"])
+            print(f"[DockerLogs] reward cal result is {output}, parser result is {reward}")
+            reward_process_info = {"lint_output": output, "reward_output": reward_output, "reward": reward, "error_code": error_code}
+            if reward != 1:
+                return 0, "lint error", True, reward_process_info
+
+            output = None
+            print(f"[RewardLogs] current pod name is {pod_name}, start calculate score!")
+        
             _, _ = pod_manager.execute_command(pod_name, f"timeout {timeout} chmod +x /workspace/text_reward_model/run.sh")
-            other_info = ds.get("other_info", {})
-            app_id = other_info.get("app_id", None)
-            prd = other_info.get("PRD", None)
-            function_list = other_info.get("function_list", None)
             func_num = len(function_list)
             # 方法1：转义单引号（推荐）
             func_json = json.dumps(function_list, ensure_ascii=False)
             func_escaped = func_json.replace("'", "'\"'\"'")
-            exec_command = f"""unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && timeout 300 bash /workspace/text_reward_model/run.sh --qid "2" --prd_id "825" --repo_path /workspace/{app_id} --prd_description "{prd}" --func_list '{func_escaped}'"""
+            #https://qianfan.baidubce.com/v2/chat/completions, CCE集群无法开代理
+            exec_command = f"""timeout {timeout} bash /workspace/text_reward_model/run.sh --qid "2" --prd_id "825" --repo_path /workspace/{app_id} --prd_description "{prd}" --func_list '{func_escaped}'"""
 
             # 使用heredoc写入文件
             heredoc_cmd = f"""cat > /workspace/test.sh << 'EOF'
@@ -883,30 +949,38 @@ class AgentExecutionEngine:
 
             output, error_code = pod_manager.execute_command(pod_name, heredoc_cmd)
             print(f"[RewardLogs] current pod name is {pod_name}, input is {exec_command}")
+            reward_process_info["write_shell"] = {"output": output, "error_code": error_code, "heredoc_cmd": heredoc_cmd}
 
             exec_command = f"timeout {timeout} bash /workspace/test.sh"
             output, error_code = pod_manager.execute_command(pod_name, exec_command)
             print(f"[RewardLogs] current pod name is {pod_name}, input is {str(heredoc_cmd)}/{output}, error_code is {error_code}")
-            
+            reward_process_info["exec_shell"] = {"output": output, "error_code": error_code}
             # Run tests using PodManager
             output, error_code = pod_manager.execute_command(pod_name, f"""timeout {timeout} """ + """cat /workspace/text_reward_model/result_dir/result_score.jsonl""")
             print(f"[RewardLogs] current pod name is {pod_name}, get result_score, result is {output}, error_code is {error_code}")
+            reward_process_info["get_score"] = {"output": output, "error_code": error_code}
             if float(error_code) != 0:
                 print(f"[RewardLogs] current pod name is {pod_name}, get result_score error, result is {output}, error_code is {error_code}")
-                reward = 0
+                raise Exception(f"[RewardLogs] current pod name is {pod_name}, get result_score error, result is {output}, error_code is {error_code}")
             else:
                 scores = []
                 for func in output.strip().split("\n"):
                     function_score = json.loads(func)
                     scores.append(function_score["function_score"])
                 reward = sum(scores) / func_num
+                #if reward < 1:
+                #    reward = 0
+                #else:
+                #    reward = 1
             print(f"[RewardLogs] miaoda reward calculation: final reward={reward}, ori reward is {output}")
-            return reward, "success"
+            return reward, "success", mask, reward_process_info
             
         except Exception as e:
+            mask = True
             stack_trace = traceback.format_exc()
-            print(f"[RewardLogs] Error in _calculate_reward_miaoda_pod_manager: {e}, pod_name is {pod_name}, output is {output}")
-            return 0.0, "error"
+            print(f"[RewardLogs] Error in _calculate_reward_miaoda_pod_manager: {e}, pod_name is {pod_name}, output is {output}, stack_trace={stack_trace}")
+            reward_process_info["error"] = {"mask": mask, "stack_trace": str(stack_trace), "recent_output": output}
+            return 0.0, "error", mask, reward_process_info
 
     def _calculate_reward_r2e_pod_manager(self, pod_manager, pod_name, ds, alt_path, timeout):
         """Calculate reward for R2E environments using PodManager"""
@@ -967,17 +1041,15 @@ class AgentExecutionEngine:
             print(f"[RewardLogs] Error in _calculate_reward_r2e_pod_manager: {e}")
             return 0.0
 
-    def _get_logs_eval_kodo(self, test_spec, content):
+    def _get_logs_eval_kodo(self, repo, version, content):
         """Evaluate logs for SWE-bench using kodo output"""
         try:
             from swebench.harness.constants import (
                 APPLY_PATCH_FAIL, RESET_FAILED, TESTS_ERROR, TESTS_TIMEOUT
             )
-            from swebench.harness.log_parsers import MAP_REPO_TO_PARSER
+            from recipe.qianfan_swe.trainer.utils.swebench_parser import MAP_REPO_TO_PARSER_PY as MAP_REPO_TO_PARSER
             from swebench.harness.constants import MAP_REPO_VERSION_TO_SPECS
-            
-            repo = test_spec.repo
-            version = test_spec.version
+
             log_parser = MAP_REPO_TO_PARSER[repo]
             test_cmd = MAP_REPO_VERSION_TO_SPECS[repo][version]["test_cmd"]
             if isinstance(test_cmd, list):
@@ -996,7 +1068,7 @@ class AgentExecutionEngine:
 
             # Get status map of evaluation results
             content = content.split(test_cmd)[-1]
-            return log_parser(content, test_spec), True
+            return log_parser(content), True
             
         except Exception as e:
             print(f"[RewardLogs] Error in _get_logs_eval_kodo: {e}")

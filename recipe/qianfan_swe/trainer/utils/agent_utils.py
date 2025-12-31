@@ -146,8 +146,9 @@ def _create_agent(i, env_args, config):
     app_id = _args.get("app_id", None)
     requirement_type = _args.get("requirement_type", None)
     working_dir = _args.get("working_dir", "/testbed")
-    sample_type = _args.get("sample_source", "r2e")
+    sample_type = _args.get("sample_type", "r2e")
     print(f"[AgentUtils] current working_dir is {working_dir}, sample_type is {sample_type}")
+    image_prefix = config.agent.get("image_prefix", "mdthre")
     
     # Determine which agent class to use
     rollout_agent = config.agent.get("rollout_agent", "SweAgent")
@@ -177,7 +178,7 @@ def _create_agent(i, env_args, config):
             pod_manager = PodManager(config=config)
 
             # Create pod using PodManager
-            pod_name, pod_info = pod_manager.create_pod(_args, pod_prefix="mdtrain")
+            pod_name, pod_info = pod_manager.create_pod(_args, pod_prefix=image_prefix)
             break
         except Exception as e:
             print(f"[WARNING] Agent {i} create failed (attempt {attempt+1}): {e}")

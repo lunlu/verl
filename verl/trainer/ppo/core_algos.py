@@ -20,6 +20,9 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import json
+import os
+from datetime import datetime
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -47,6 +50,48 @@ PolicyLossFn = Callable[
 ]
 
 POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
+    
+
+def process_token_sequences(responses, start_tokens, end_tokens):
+    """
+    Find segments in responses that start with start_tokens and end with end_tokens.
+    
+    Args:
+        responses: torch.Tensor of shape (seq_len,) containing token ids
+        start_tokens: List of token ids that mark the start of a segment
+        end_tokens: List of token ids that mark the end of a segment
+        
+    Returns:
+        List of tuples (start_idx, end_idx) for each found segment
+    """
+    segments = []
+    responses_list = responses.tolist()
+    
+    i = 0
+    while i < len(responses_list):
+        # Look for start_tokens
+        if i + len(start_tokens) <= len(responses_list):
+            if responses_list[i:i+len(start_tokens)] == start_tokens:
+                start_idx = i + len(start_tokens)  # Start after the start tokens
+                
+                # Look for end_tokens after start_tokens
+                j = start_idx
+                while j + len(end_tokens) <= len(responses_list):
+                    if responses_list[j:j+len(end_tokens)] == end_tokens:
+                        end_idx = j + len(end_tokens)  # End after the end tokens (include end tokens)
+                        segments.append((start_idx, end_idx))
+                        i = j + len(end_tokens)
+                        break
+                    j += 1
+                else:
+                    # If no end token found, continue searching
+                    i += 1
+            else:
+                i += 1
+        else:
+            i += 1
+    
+    return segments
 
 
 def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
@@ -103,6 +148,7 @@ class AdvantageEstimator(str, Enum):
     LOOP = 'loop'
     GRPO_PASSK = "grpo_passk"
     GPG = "gpg"
+    LOOP_EMPG = "loop_empg"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -725,6 +771,186 @@ def compute_gpg_outcome_advantage(
 
     return scores, scores
 
+@register_adv_est(AdvantageEstimator.LOOP_EMPG)  # or simply: @register_adv_est("gpg")
+def compute_loop_empg_outcome_advantage(
+    responses: torch.Tensor,
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    old_entropy: torch.Tensor,
+    k: float = 1.0,
+    k_f: float = 1.0,
+    zeta: float = 0,
+    epsilon: float = 1e-8
+):
+    """
+    Compute advantage for LOOP + EMPG (Entropy-Modulated Policy Gradient).
+
+    This function first computes LOOP advantages (same as GRPO without normalization),
+    then applies EMPG modulation based on token-level entropy from assistant segments.
+
+    Modified to use per-UID (group-level) entropy normalization.
+    Future clarity bonus (f_H) has been disabled.
+
+    Args:
+        responses: `(torch.Tensor)` shape: (bs, response_length) - token ids
+        token_level_rewards: `(torch.Tensor)` shape: (bs, response_length)
+        response_mask: `(torch.Tensor)` shape: (bs, response_length)
+        index: `(np.ndarray)` UIDs for grouping samples
+        old_entropy: `(torch.Tensor)` shape: (bs, response_length) - token-level entropy
+        k (float): Hyperparameter for self-calibrating gradient scaling
+        k_f (float): [UNUSED] Future clarity bonus disabled
+        zeta (float): [UNUSED] Future clarity bonus disabled
+        epsilon (float): Small value to avoid division by zero
+
+    Returns:
+        advantages: `(torch.Tensor)` shape: (bs, response_length)
+        returns: `(torch.Tensor)` shape: (bs, response_length)
+    """
+    # Step 1: Compute base LOOP advantages (same as original LOOP implementation)
+    scores = token_level_rewards.sum(dim=-1)
+    id2samples = defaultdict(list)
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+
+        # LOOP computation (same as original)
+        for i in range(bsz):
+            id2samples[index[i]].append((i, scores[i]))
+
+        for group in id2samples.values():
+            group_size = len(group)
+            total_score = sum(score for _, score in group)
+            for i, score in group:  # i is original index
+                loo_baseline = 0
+                if group_size == 1:
+                    print("Cannot compute LOO advantage using 1 sample. 0 baseline is used")
+                else:
+                    loo_baseline = (total_score - score) / (group_size - 1)
+                scores[i] = score - loo_baseline
+
+        # Convert to token-level advantages (broadcast)
+        advantages = scores.unsqueeze(-1) * response_mask
+
+        # Step 2: Apply EMPG modulation
+        # If no tokenizer provided, use default Qwen3-32B tokenizer
+
+
+        # --- 1. First Pass: Collect Step-Level Entropies ---
+        all_step_entropies = []
+        # segments_to_modify stores {'sample_idx', 'start', 'end'} for each step
+        segments_to_modify = []
+
+        # Get assistant start and end tokens
+        assistant_start_tokens = [151644, 77091, 198] #<|im_start|>assistant\n
+        assistant_end_tokens = [151645] # <|im_end|>
+        print("DEBUG:assistant_start_tokens", assistant_start_tokens)
+        print("DEBUG:assistant_end_tokens", assistant_end_tokens)
+
+        for i in range(bsz):
+            # Find "assistant" segments, which correspond to agent steps.
+            token_segments = process_token_sequences(
+                responses[i],
+                assistant_start_tokens,
+                assistant_end_tokens
+            )
+            j = 0
+            while j < len(responses[i]):
+                if responses[i][j] == assistant_end_tokens[0]:
+                    break
+                j += 1
+            token_segments.insert(0, (0, j+1))
+            for start, end in token_segments:
+                if start >= end or start >= responses.shape[1] or end > responses.shape[1]:
+                    continue
+
+                # Calculate the average token-level entropy for the step
+                step_entropy = old_entropy[i][start:end].mean().item()
+                all_step_entropies.append(step_entropy)
+                segments_to_modify.append({
+                    'sample_idx': i,
+                    'start': start,
+                    'end': end,
+                })
+
+
+        if not all_step_entropies:
+            return advantages, advantages
+
+        # --- 2. Calculate Modulated Advantage Components (Per-UID) ---
+        H = np.array(all_step_entropies)
+
+        # Build mapping from step index to UID
+        step_to_uid = [index[seg['sample_idx']] for seg in segments_to_modify]
+        unique_uids = np.unique(index)
+
+        # Initialize g_H with ones (no modulation by default)
+        # NOTE: f_H (future clarity bonus) has been removed
+        g_H_array = np.ones(len(H))
+
+        # Per-UID entropy normalization and g_H calculation
+        for uid in unique_uids:
+            # Find all step indices belonging to this UID
+            uid_step_mask = np.array([u == uid for u in step_to_uid])
+            uid_step_indices = np.where(uid_step_mask)[0]
+
+            if len(uid_step_indices) == 0:
+                continue
+
+            # Get entropies for this UID
+            H_uid = H[uid_step_indices]
+
+            # Group-level entropy normalization
+            min_H_uid = np.min(H_uid)
+            max_H_uid = np.max(H_uid)
+
+            # Protection: if entropy range is too small, skip modulation for this UID
+            if max_H_uid - min_H_uid < 0.1:
+                print(f"[EMPG] UID {uid}: entropy range too small ({max_H_uid - min_H_uid:.4f}), skipping modulation")
+                g_H_array[uid_step_indices] = 1.0
+                continue
+
+            # Normalize entropy within this UID's range
+            H_norm_uid = (H_uid - min_H_uid) / (max_H_uid - min_H_uid + epsilon)
+
+            # Self-calibrating gradient scaling g(H) (per-UID)
+            g_H_unnormalized_uid = np.exp(-k * H_norm_uid)
+            mean_g_H_uid = np.mean(g_H_unnormalized_uid)
+            g_H_uid = g_H_unnormalized_uid / (mean_g_H_uid + epsilon)
+
+            # Assign to global array
+            g_H_array[uid_step_indices] = g_H_uid
+
+
+        # Convert to tensor for PyTorch operations
+        device = advantages.device
+        g_H = torch.tensor(g_H_array, device=device, dtype=torch.float32)
+
+        # --- 3. Second Pass: Apply Advantage Modulation (Eq. 8) ---
+        step_advantages = []
+        original_advantages = []  # Store original advantages before modulation
+        for i, segment in enumerate(segments_to_modify):
+            idx, start, end = segment['sample_idx'], segment['start'], segment['end']
+
+            # Save original advantage before modulation
+            original_advantage = advantages[idx][start:end].mean().item()
+            original_advantages.append(original_advantage)
+
+            # Apply self-calibrating gradient scaling
+            advantages[idx][start:end] *= g_H[i]
+
+            # NOTE: Future clarity bonus (zeta * f_H) has been removed
+            step_advantages.append(advantages[idx][start])
+
+        # --- 4. Per-UID Statistics (No Mean Subtraction) ---
+        # NOTE: 组内均值归一化已禁用，以彻底解决符号翻转问题
+        # - 成功样本（reward ≥ 1）→ 优势一定为正
+        # - 失败样本（reward ≤ 0）→ 优势一定为负
+        # LOOP优势（reward - mean_of_others）已自然编码成功/失败信息
+        # 组内g_H提供熵调制，无需再减均值
+
+    return advantages, advantages
+
 
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     """Compute token-level rewards with KL penalty.
@@ -856,6 +1082,8 @@ def compute_policy_loss(
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
 
 @register_policy_loss("vanilla_v2")
 def compute_policy_loss_vanilla_v2(

@@ -223,6 +223,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
         )
 
+        if self.config.rollout.name == "vllm":
+            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+            os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
+
         self._is_offload_param = False
         self._is_offload_optimizer = False
         if self._is_actor:
@@ -845,29 +849,50 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             metrics["actor/lr"] = lr
             self.actor_lr_scheduler.step()
             
-#             non_tensor_dict = {}
-#             # TODO: here, we should return all metrics
-#             if "logs_prob_list" in metrics:
-#                 logs_prob_list = metrics["logs_prob_list"]
-#                 non_tensor_dict["non_tensor_dict"] = non_tensor_dict
-#                 del metrics["logs_prob_list"]
-#             if "old_logs_prob_list" in metrics:
-#                 old_logs_prob_list = metrics["old_logs_prob_list"]
-#                 non_tensor_dict["old_logs_prob_list"] = old_logs_prob_list
-#                 del metrics["old_logs_prob_list"]
-#             if "advantage_list" in metrics:
-#                 advantage_list = metrics["advantage_list"]
-#                 non_tensor_dict["advantage_list"] = advantage_list
-#                 del metrics["advantage_list"]
-#             if "response_mask_list" in metrics:
-#                 response_mask_list = metrics["response_mask_list"]
-#                 non_tensor_dict["response_mask_list"] = response_mask_list
-#                 del metrics["response_mask_list"]
+            non_tensor_dict = {}
+            non_tensors = {}
+            # TODO: here, we should return all metrics
+            if "logs_prob_list" in metrics:
+                logs_prob_list = metrics["logs_prob_list"]
+                non_tensor_dict["logs_prob_list"] = torch.Tensor(logs_prob_list)
+                del metrics["logs_prob_list"]
+            if "old_logs_prob_list" in metrics:
+                old_logs_prob_list = metrics["old_logs_prob_list"]
+                non_tensor_dict["old_logs_prob_list"] = torch.Tensor(old_logs_prob_list)
+                del metrics["old_logs_prob_list"]
+            if "advantage_list" in metrics:
+                advantage_list = metrics["advantage_list"]
+                non_tensor_dict["advantage_list"] = torch.Tensor(advantage_list)
+                del metrics["advantage_list"]
+            if "response_mask_list" in metrics:
+                response_mask_list = metrics["response_mask_list"]
+                non_tensor_dict["response_mask_list"] = torch.Tensor(response_mask_list)
+                del metrics["response_mask_list"]
+            if "inf_log_probs_list" in metrics:
+                inf_log_probs_list = metrics["inf_log_probs_list"]
+                non_tensor_dict["inf_log_probs_list"] = torch.Tensor(inf_log_probs_list)
+                del metrics["inf_log_probs_list"]
+            if "input_ids_list" in metrics:
+                input_ids_list = metrics["input_ids_list"]
+                non_tensor_dict["input_ids_list"] = torch.Tensor(input_ids_list)
+                del metrics["input_ids_list"]
+            if "response_ids_list" in metrics:
+                response_ids_list = metrics["response_ids_list"]
+                non_tensor_dict["response_ids_list"] = torch.Tensor(response_ids_list)
+                del metrics["response_ids_list"]
+            if "entropy_list" in metrics:
+                entropy_list = metrics["entropy_list"]
+                non_tensor_dict["entropy_list"] = torch.Tensor(entropy_list)
+                del metrics["entropy_list"]
+            if "trajectory_uuids_list" in metrics:
+                trajectory_uuids_list = metrics["trajectory_uuids_list"]
+                non_tensors["trajectory_uuids_list"] = np.array(trajectory_uuids_list)
+                del metrics["trajectory_uuids_list"]
                 
-#             output = DataProto.from_dict(non_tensors=non_tensor_dict, meta_info={"metrics": metrics})
+            output = DataProto.from_dict(tensors=non_tensor_dict, non_tensors=non_tensors, meta_info={"metrics": metrics})
             
             # TODO: here, we should return all metrics
-            output = DataProto(meta_info={"metrics": metrics})
+#             output = DataProto(meta_info={"metrics": metrics})
 
             output = output.to("cpu")
 

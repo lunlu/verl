@@ -144,6 +144,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         self.bridge = bridge
         self.rank = torch.distributed.get_rank()
         self.use_dist_checkpointing = use_dist_checkpointing or not self.bridge or self.is_value_model
+        self.use_dist_checkpointing = True
         self.use_hf_checkpoint = not self.use_dist_checkpointing
 
         self.weight_saver = None

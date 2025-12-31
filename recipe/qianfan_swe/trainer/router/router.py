@@ -36,6 +36,8 @@ the communication layer between agents and distributed model inference servers.
 import asyncio
 import logging
 from copy import deepcopy
+import time
+import uuid
 
 import aiohttp
 import numpy as np
@@ -157,11 +159,18 @@ async def poll_completions_openai(address: str, **completions_request) -> Comple
     for retry in range(max_retries):
         try:
             # Create a new session for each request to avoid blocking
+            # NOTE: Set proxy="" to bypass environment proxy settings (http_proxy/https_proxy)
+            # This is necessary when accessing internal network addresses while proxy is set globally
             async with aiohttp.ClientSession() as session:
-                async with session.post(base_url, json=completions_request, headers=headers, timeout=aiohttp.ClientTimeout(total=5400)) as response:
+                async with session.post(
+                    base_url,
+                    json=completions_request,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=5400)
+                ) as response:
                     if response.status != 200:
                         error_text = await response.text()
-                        print(f"API request params is : base_url={base_url}, headers={headers}")
+                        print(f"API request params is : base_url={base_url}, headers={headers}, Error, error_text is {error_text}")
                         raise Exception(f"API request failed with status {response.status}: {error_text}")
                     result = await response.json()
                     # Convert the raw JSON response to an OpenAI Completion object
@@ -281,6 +290,8 @@ class Router:
         if batch.meta_info.get("agent_rollout", False):
             kwargs["n"] = 1
 
+        if "temperature" in sampling_params:
+            del sampling_params["temperature"]
         kwargs.update(sampling_params)
         
         address = await self.get_address(application_id)
@@ -295,11 +306,12 @@ class Router:
         # Bug: len(batch) is used later but batch might not have a __len__ method
         batch_size = len(batch.non_tensor_batch["formatted_prompts"])
         batch_response_ids: list[list[int]] = [[] for _ in range(batch_size)]
-
-        print(f"[TrainingLogsRouter] current idx is {idx}, current application id is {application_id}, request address is {address}, model is {self.model_name}, kwargs is {kwargs}")
-        
-        import time
+    
+        uid_str = str(uuid.uuid4())
+        kwargs["uid_str"] = uid_str
         start_time = time.time()
+        print(f"[TrainingLogsRouter] current idx is {idx}, current application id is {application_id}, request address is {address}, model is {self.model_name}, kwargs is {kwargs}, uid_str is {uid_str}, start_time is {start_time}!")
+        
         for batch_index, formatted_prompt in enumerate(batch.non_tensor_batch["formatted_prompts"]):
             # For Completion API, we need to convert the conversation to a prompt string
             self.counter += 1
@@ -311,23 +323,27 @@ class Router:
                     **kwargs,
                 )
             )
-        
-        
 
         # Potential blocking: asyncio.gather can block if any task takes too long
         logger.debug("Sending total requests: %s", self.counter)
         completions_list = await asyncio.gather(*tasks)
         await self.release_address(address, application_id)  # Release the address when done
-
+        
+        end_time = time.time()
+        print(f"[TrainingLogsRouter] current idx is {idx}, current application id is {application_id}, request address is {address}, model is {self.model_name}, gather cost time {end_time - start_time}, uid_str is {uid_str}, end_time is {end_time}!")
+        
         for batch_index, completions in enumerate(completions_list):
             comps = []
             for choice in completions.get("choices", []):
                 token_ids = choice.get("logprobs", {}).get("tokens", [])
-                token_ids = [int(t.split(":")[1]) for t in token_ids]
+                if token_ids:
+                    token_ids = [int(t.split(":")[1]) for t in token_ids]
+                else:
+                    token_ids = self.tokenizer.encode(choice["text"] + self.tokenizer.eos_token)
                 comps.append(token_ids)
             batch_response_ids[batch_index] = comps
-        end_time = time.time()
-        print(f"[TrainingLogsRouter] current idx is {idx}, current application id is {application_id}, request address is {address}, model is {self.model_name}, kwargs is {kwargs}, cost time {end_time - start_time}")
+        end_time1 = time.time()
+        print(f"[TrainingLogsRouter] current idx is {idx}, current application id is {application_id}, request address is {address}, model is {self.model_name}, kwargs is {kwargs}, cost time {end_time1 - start_time}, parser cost time {end_time1 - end_time}!")
 
 #         return await self.postprocess_batch(batch, batch_response_ids, kwargs["n"])
         # Extract inference log probs for IcePop
